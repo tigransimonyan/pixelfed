@@ -44,7 +44,7 @@
 					<i class="far fa-chevron-left fa-lg text-lighter"></i>
 				</button>
 				<div>
-					<img :src="getAvatar()" class="avatar img-fluid shadow border" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
+					<img :src="getAvatar()" class="avatar img-fluid border" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
 					<p v-if="profile.is_admin" class="text-right" style="margin-top: -30px;"><span class="admin-label">Admin</span></p>
 				</div>
 				<!-- <button class="btn btn-link">
