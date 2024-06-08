@@ -78,10 +78,10 @@
 								<!-- DESKTOP PROFILE PICTURE -->
 								<div class="d-none d-md-block pb-3">
 									<div v-if="hasStory" class="has-story-lg cursor-pointer shadow-sm" @click="storyRedirect()">
-										<img :alt="profileUsername + '\'s profile picture'" class="rounded-circle box-shadow cursor-pointer" :src="profile.avatar" width="150px" height="150px" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
+										<img :alt="profileUsername + '\'s profile picture'" class="rounded-circle cursor-pointer" :src="profile.avatar" width="150px" height="150px" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
 									</div>
 									<div v-else>
-										<img :alt="profileUsername + '\'s profile picture'" class="rounded-circle box-shadow" :src="profile.avatar" width="150px" height="150px" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
+										<img :alt="profileUsername + '\'s profile picture'" class="rounded-circle" :src="profile.avatar" width="150px" height="150px" onerror="this.onerror=null;this.src='/storage/avatars/default.png?v=0';">
 									</div>
 									<p v-if="sponsorList.patreon || sponsorList.liberapay || sponsorList.opencollective" class="text-center mt-3">
 										<button type="button" @click="showSponsorModal" class="btn btn-outline-secondary font-weight-bold py-0">
@@ -209,9 +209,9 @@
 												:src="s.media_attachments[0].preview_url"
 												/>
 										</div>
-										<span v-if="s.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images fa-2x"></i></span>
-										<span v-if="s.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video fa-2x"></i></span>
-										<span v-if="s.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film fa-2x"></i></span>
+										<span v-if="s.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images"></i></span>
+										<span v-if="s.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video"></i></span>
+										<span v-if="s.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film"></i></span>
 										<div class="info-overlay-text">
 											<h5 class="text-white m-auto font-weight-bold">
 												<span>
@@ -252,9 +252,9 @@
 								<div class="col-4 p-1 p-sm-2 p-md-3" v-for="(s, index) in bookmarks">
 									<a class="card info-overlay card-md-border-0" :href="s.url">
 										<div class="square">
-											<span v-if="s.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images fa-2x"></i></span>
-											<span v-if="s.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video fa-2x"></i></span>
-											<span v-if="s.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film fa-2x"></i></span>
+											<span v-if="s.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images"></i></span>
+											<span v-if="s.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video"></i></span>
+											<span v-if="s.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film"></i></span>
 											<div class="square-content" v-bind:style="previewBackground(s)">
 											</div>
 											<div class="info-overlay-text">
@@ -291,7 +291,7 @@
 						</div>
 						<div v-else>
 							<div class="py-5 text-center text-muted">
-								<p><i class="fas fa-images fa-2x"></i></p>
+								<p><i class="fas fa-images"></i></p>
 								<p class="h2 font-weight-light pt-3">No collections yet</p>
 							</div>
 						</div>

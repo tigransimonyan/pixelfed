@@ -84,9 +84,9 @@
 									:src="tag.status.media_attachments[0].preview_url"
 									/>
 							</div>
-							<span v-if="tag.status.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images fa-2x"></i></span>
-							<span v-if="tag.status.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video fa-2x"></i></span>
-							<span v-if="tag.status.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film fa-2x"></i></span>
+							<span v-if="tag.status.pf_type == 'photo:album'" class="float-right mr-3 post-icon"><i class="fas fa-images"></i></span>
+							<span v-if="tag.status.pf_type == 'video'" class="float-right mr-3 post-icon"><i class="fas fa-video"></i></span>
+							<span v-if="tag.status.pf_type == 'video:album'" class="float-right mr-3 post-icon"><i class="fas fa-film"></i></span>
 							<div class="info-overlay-text">
 								<h5 class="text-white m-auto font-weight-bold">
 									<span>
