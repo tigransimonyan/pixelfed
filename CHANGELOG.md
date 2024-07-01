@@ -1,10 +1,12 @@
 # Release Notes
 
-## [Unreleased](https://github.com/pixelfed/pixelfed/compare/v0.12.2...dev)
+## [Unreleased](https://github.com/pixelfed/pixelfed/compare/v0.12.3...dev)
+-  ([](https://github.com/pixelfed/pixelfed/commit/))
+
+## [v0.12.3 (2024-07-01)](https://github.com/pixelfed/pixelfed/compare/v0.12.2...v0.12.3)
 
 ### Updates
 - Fix migrations bug ([4d1180b1](https://github.com/pixelfed/pixelfed/commit/4d1180b1))
--  ([](https://github.com/pixelfed/pixelfed/commit/))
 
 ## [v0.12.2 (2024-07-01)](https://github.com/pixelfed/pixelfed/compare/v0.12.1...v0.12.2)
 
