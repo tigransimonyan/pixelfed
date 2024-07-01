@@ -1,6 +1,12 @@
 # Release Notes
 
-## [Unreleased](https://github.com/pixelfed/pixelfed/compare/v0.12.1...dev)
+## [Unreleased](https://github.com/pixelfed/pixelfed/compare/v0.12.2...dev)
+-  ([](https://github.com/pixelfed/pixelfed/commit/))
+
+## [v0.12.2 (2024-07-01)](https://github.com/pixelfed/pixelfed/compare/v0.12.1...v0.12.2)
+
+### Framework
+- Updated to Laravel 11 (requires php 8.2+)
 
 ### Added
 - New api/v1/instance/peers API endpoint, disabled by default ([4aad1c22](https://github.com/pixelfed/pixelfed/commit/4aad1c22))
@@ -23,9 +29,17 @@
 - Update ApiV1Controller, fix update_credentials boolean handling ([19c62aaa](https://github.com/pixelfed/pixelfed/commit/19c62aaa))
 - Update ApiV1Controller, fix cache invalidation bug in update_credentials ([d56a4108](https://github.com/pixelfed/pixelfed/commit/d56a4108))
 - Update ApiV1Controller, fix self relationship response ([28bc7aa4](https://github.com/pixelfed/pixelfed/commit/28bc7aa4))
--  ([](https://github.com/pixelfed/pixelfed/commit/))
--  ([](https://github.com/pixelfed/pixelfed/commit/))
--  ([](https://github.com/pixelfed/pixelfed/commit/))
+- Update ApiController, add pe support to like/unlike endpoints ([679ef677](https://github.com/pixelfed/pixelfed/commit/679ef677))
+- Update ApiV1Dot1Controller, fix username to id endpoint ([4d6cea9a](https://github.com/pixelfed/pixelfed/commit/4d6cea9a))
+- Update StatusController, cache AP object ([a75b89b2](https://github.com/pixelfed/pixelfed/commit/a75b89b2))
+- Update status embed, add support for album carousels ([f4898db9](https://github.com/pixelfed/pixelfed/commit/f4898db9))
+- Update profile embeds, add support for albums ([4fd156c4](https://github.com/pixelfed/pixelfed/commit/4fd156c4))
+- Update DirectMessageController, add timestamps to threads ([b24d2554](https://github.com/pixelfed/pixelfed/commit/b24d2554))
+- Update DirectMessageController, add carousel entity to threads ([96f24f33](https://github.com/pixelfed/pixelfed/commit/96f24f33))
+- Update and refactor total local post count logic, cache value and schedule updates twice daily to eliminate the perf issue on larger instances ([4f2b8ed2](https://github.com/pixelfed/pixelfed/commit/4f2b8ed2))
+- Update Media model, fix broken thumbnail/gray thumbnail bug ([e33643c2](https://github.com/pixelfed/pixelfed/commit/e33643c2))
+- Update StatusController, fix unlisted post guest/ap access bug ([83098428](https://github.com/pixelfed/pixelfed/commit/83098428))
+- Update discover, add network trending using Beagle API ([2cae8b48](https://github.com/pixelfed/pixelfed/commit/2cae8b48))
 
 ## [v0.12.1 (2024-05-07)](https://github.com/pixelfed/pixelfed/compare/v0.12.0...v0.12.1)
 

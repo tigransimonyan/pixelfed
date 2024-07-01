@@ -1649,7 +1649,7 @@ class ApiV1Controller extends Controller
             $stats = Cache::remember('api:v1:instance-data:stats', 43200, function () {
                 return [
                     'user_count' => User::count(),
-                    'status_count' => Status::whereNull('uri')->count(),
+                    'status_count' => StatusService::totalLocalStatuses(),
                     'domain_count' => Instance::count(),
                 ];
             });
@@ -3403,10 +3403,9 @@ class ApiV1Controller extends Controller
         $limitKey = 'compose:rate-limit:store:'.$user->id;
         $limitTtl = now()->addMinutes(15);
         $limitReached = Cache::remember($limitKey, $limitTtl, function () use ($user) {
+            $minId = SnowflakeService::byDate(now()->subDays(1));
             $dailyLimit = Status::whereProfileId($user->profile_id)
-                ->whereNull('in_reply_to_id')
-                ->whereNull('reblog_of_id')
-                ->where('created_at', '>', now()->subDays(1))
+                ->where('id', '>', $minId)
                 ->count();
 
             return $dailyLimit >= 1000;
@@ -3755,7 +3754,6 @@ class ApiV1Controller extends Controller
         }
 
         $res = StatusHashtag::whereHashtagId($tag->id)
-            ->whereIn('status_visibility', ['public', 'private', 'unlisted'])
             ->where('status_id', $dir, $id)
             ->orderBy('status_id', 'desc')
             ->limit(100)
