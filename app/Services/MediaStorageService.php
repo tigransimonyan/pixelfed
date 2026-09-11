@@ -5,13 +5,10 @@ namespace App\Services;
 use App\Jobs\AvatarPipeline\AvatarStorageCleanup;
 use App\Jobs\MediaPipeline\MediaDeletePipeline;
 use App\Jobs\StatusPipeline\NewStatusPipeline;
-use App\Media;
-use App\Status;
+use App\Models\Media;
+use App\Models\Status;
 use App\Util\ActivityPub\Helpers;
-use GuzzleHttp\Client;
-use GuzzleHttp\Exception\RequestException;
 use Illuminate\Http\File;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
@@ -44,32 +41,10 @@ class MediaStorageService
 
     public static function head($url)
     {
-        $c = new Client;
-        try {
-            $r = $c->request('HEAD', $url);
-        } catch (RequestException $e) {
-            return false;
-        }
-
-        $h = Arr::mapWithKeys($r->getHeaders(), function ($item, $key) {
-            return [strtolower($key) => last($item)];
-        });
-
-        if (! isset($h['content-length'], $h['content-type'])) {
-            return false;
-        }
-
-        $len = (int) $h['content-length'];
-        $mime = $h['content-type'];
-
-        if ($len < 10 || $len > ((config_cache('pixelfed.max_photo_size') * 1000))) {
-            return false;
-        }
-
-        return [
-            'length' => $len,
-            'mime' => $mime,
-        ];
+        // SSRF-hardened: validates URL, resolves + rejects private/reserved
+        // IPs, pins the connection to the validated address, and refuses to
+        // follow redirects into internal networks. See SecureMediaFetchService.
+        return SecureMediaFetchService::head($url, (int) config_cache('pixelfed.max_photo_size') * 1000);
     }
 
     protected function cloudStore($media)
@@ -152,7 +127,8 @@ class MediaStorageService
             return;
         }
 
-        $head = $this->head($media->remote_url);
+        // Hardened HEAD (IP-validated, pinned, no internal redirects).
+        $head = $this->head($url);
 
         if (! $head) {
             return;
@@ -203,25 +179,34 @@ class MediaStorageService
         $tmpBase = storage_path('app/remcache/');
         $tmpPath = $media->profile_id.'-'.$path;
         $tmpName = $tmpBase.$tmpPath;
-        $data = file_get_contents($url, false, null, 0, $head['length']);
-        file_put_contents($tmpName, $data);
-        $hash = hash_file('sha256', $tmpName);
-
-        $disk = Storage::disk(config('filesystems.cloud'));
-        $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
-        $permalink = $disk->url($file);
-
-        $media->media_path = $file;
-        $media->cdn_url = $permalink;
-        $media->original_sha256 = $hash;
-        $media->replicated_at = now();
-        $media->save();
-
-        if ($media->status_id) {
-            Cache::forget('status:transformer:media:attachments:'.$media->status_id);
+        // Hardened byte fetch through the same validated, pinned, redirect-safe path.
+        $data = SecureMediaFetchService::get($url, $max_size, $head['length']);
+        if ($data === false) {
+            return;
         }
+        file_put_contents($tmpName, $data);
 
-        unlink($tmpName);
+        try {
+            $hash = hash_file('sha256', $tmpName);
+
+            $disk = Storage::disk(config('filesystems.cloud'));
+            $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
+            $permalink = $disk->url($file);
+
+            $media->media_path = $file;
+            $media->cdn_url = $permalink;
+            $media->original_sha256 = $hash;
+            $media->replicated_at = now();
+            $media->save();
+
+            if ($media->status_id) {
+                Cache::forget('status:transformer:media:attachments:'.$media->status_id);
+            }
+        } finally {
+            if (is_file($tmpName)) {
+                @unlink($tmpName);
+            }
+        }
     }
 
     protected function fetchAvatar($avatar, $local = false, $skipRecentCheck = false)
@@ -273,44 +258,49 @@ class MediaStorageService
         }
 
         $base = ($local ? 'public/cache/' : 'cache/').'avatars/'.$avatar->profile_id;
-        $ext = ($head['mime'] == 'image/png') ? 'png' : 'jpg';
-        $path = 'avatar_'.strtolower(Str::random(random_int(3, 6))).'.'.$ext;
         $tmpBase = storage_path('app/remcache/');
-        $tmpPath = 'avatar_'.$avatar->profile_id.'-'.$path;
-        $tmpName = $tmpBase.$tmpPath;
-        $data = @file_get_contents($url, false, null, 0, $head['length']);
+        $data = SecureMediaFetchService::get($url, $max_size, $head['length']);
         if (! $data) {
             return;
         }
+
+        $tmpPath = 'avatar_'.$avatar->profile_id.'-tmp';
+        $tmpName = $tmpBase.$tmpPath;
         file_put_contents($tmpName, $data);
 
-        $mimeCheck = Storage::mimeType('remcache/'.$tmpPath);
+        try {
+            $mimeCheck = Storage::mimeType('remcache/'.$tmpPath);
 
-        if (! $mimeCheck || ! in_array($mimeCheck, ['image/png', 'image/jpeg', 'image/jpg'])) {
+            if (! $mimeCheck || ! in_array($mimeCheck, ['image/png', 'image/jpeg', 'image/jpg'])) {
+                $avatar->last_fetched_at = now();
+                $avatar->save();
+
+                return;
+            }
+
+            $ext = ($mimeCheck === 'image/png') ? 'png' : 'jpg';
+            $path = 'avatar_'.strtolower(Str::random(random_int(3, 6))).'.'.$ext;
+
+            $disk = Storage::disk($driver);
+            $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
+            $permalink = $disk->url($file);
+
+            $avatar->media_path = $base.'/'.$path;
+            $avatar->is_remote = true;
+            $avatar->cdn_url = $local ? config('app.url').$permalink : $permalink;
+            $avatar->size = $head['length'];
+            $avatar->change_count = $avatar->change_count + 1;
             $avatar->last_fetched_at = now();
             $avatar->save();
-            unlink($tmpName);
 
-            return;
+            Cache::forget('avatar:'.$avatar->profile_id);
+            AccountService::del($avatar->profile_id);
+            AvatarStorageCleanup::dispatch($avatar)->onQueue($queue)->delay(now()->addMinutes(random_int(3, 15)));
+        } finally {
+            if (is_file($tmpName)) {
+                @unlink($tmpName);
+            }
         }
-
-        $disk = Storage::disk($driver);
-        $file = $disk->putFileAs($base, new File($tmpName), $path, 'public');
-        $permalink = $disk->url($file);
-
-        $avatar->media_path = $base.'/'.$path;
-        $avatar->is_remote = true;
-        $avatar->cdn_url = $local ? config('app.url').$permalink : $permalink;
-        $avatar->size = $head['length'];
-        $avatar->change_count = $avatar->change_count + 1;
-        $avatar->last_fetched_at = now();
-        $avatar->save();
-
-        Cache::forget('avatar:'.$avatar->profile_id);
-        AccountService::del($avatar->profile_id);
-        AvatarStorageCleanup::dispatch($avatar)->onQueue($queue)->delay(now()->addMinutes(random_int(3, 15)));
-
-        unlink($tmpName);
     }
 
     public static function delete(Media $media, $confirm = false)

@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use Carbon\Carbon;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -175,7 +176,16 @@ class StoryIndexService
         $path = $story->path;
 
         Redis::pipeline(function ($pipe) use (
-            $author, $sid, $score, $ttl, $duration, $overlays, $viewCount, $createdIso, $type, $path
+            $author,
+            $sid,
+            $score,
+            $ttl,
+            $duration,
+            $overlays,
+            $viewCount,
+            $createdIso,
+            $type,
+            $path
         ) {
             $keyStory = $this->storyKey($sid);
             $keyAuth = $this->authorKey($author);
@@ -232,6 +242,36 @@ class StoryIndexService
         $finalTtl = max($ttl, $currentTtl);
 
         Redis::expire($key, $finalTtl);
+    }
+
+    /**
+     * Keep the cached following set in sync when a follow is created.
+     * Only touches the key if it already exists; otherwise the next carousel
+     * fetch hydrates from SQL and picks up the new follow anyway.
+     */
+    public function addFollowing(int $followerId, int $followingId): void
+    {
+        $key = "following:{$followerId}";
+
+        if (! Redis::exists($key)) {
+            return;
+        }
+
+        Redis::sadd($key, (string) $followingId);
+    }
+
+    /**
+     * Keep the cached following set in sync when a follow is removed.
+     */
+    public function removeFollowing(int $followerId, int $followingId): void
+    {
+        $key = "following:{$followerId}";
+
+        if (! Redis::exists($key)) {
+            return;
+        }
+
+        Redis::srem($key, (string) $followingId);
     }
 
     public function rebuildIndex(): array
@@ -330,7 +370,6 @@ class StoryIndexService
                 'message' => 'Story index and seen data rebuilt successfully',
                 'stats' => $stats,
             ];
-
         } finally {
             Redis::del($lockKey);
         }
@@ -615,7 +654,7 @@ class StoryIndexService
                 'stories' => collect($storyItems)->sortBy('id')->values()->all(),
                 'url' => $url,
                 'hasViewed' => false,
-                '_latest_ts' => \Carbon\Carbon::parse($profileStories->first()->created_at)->timestamp,
+                '_latest_ts' => Carbon::parse($profileStories->first()->created_at)->timestamp,
             ];
         }
 
@@ -656,7 +695,6 @@ class StoryIndexService
         if (! $hasResults) {
             Redis::pipeline(function ($pipe) use ($followingKey) {
                 $pipe->sadd($followingKey, '__empty__');
-                $pipe->srem($followingKey, '__empty__');
                 $pipe->expire($followingKey, 3600);
             });
         } else {
@@ -667,5 +705,61 @@ class StoryIndexService
     private function withScoresOpt()
     {
         return config('database.redis.client') === 'predis' ? ['withscores' => true] : true;
+    }
+
+    public function hasActiveStory(int $profileId): bool
+    {
+        return $this->activeStoryCount($profileId) > 0;
+    }
+
+    public function activeStoryCount(int $profileId): int
+    {
+        $min = '('.(time() - self::STORY_TTL);
+
+        return $this->redisInt(fn () => Redis::zcount($this->authorKey($profileId), $min, '+inf'));
+    }
+
+    /**
+     * Newest live story id for an author, or null. Same window as above.
+     */
+    public function latestStoryId(int $profileId): ?int
+    {
+        $min = '('.(time() - self::STORY_TTL);
+
+        $ids = $this->redisArray(fn () => Redis::zrevrangebyscore(
+            $this->authorKey($profileId),
+            '+inf',
+            $min,
+            ['limit' => [0, 1]]
+        ));
+
+        return $ids ? (int) $ids[0] : null;
+    }
+
+    /**
+     * Story ids the viewer has seen from this author. Empty if nothing is
+     * recorded (or the seen key already expired with the stories).
+     */
+    public function seenStoryIds(int $viewerId, int $authorId): array
+    {
+        return $this->redisArray(fn () => Redis::smembers($this->seenKey($viewerId, $authorId)));
+    }
+
+    /**
+     * True when the index positively knows the viewer saw this story.
+     * False means "not recorded here", not "definitely unseen".
+     */
+    public function hasSeen(int $viewerId, int $storyId): bool
+    {
+        $authorId = Redis::hget($this->storyKey($storyId), 'profile_id');
+
+        if (! $authorId) {
+            return false;
+        }
+
+        return $this->redisBool(fn () => Redis::sismember(
+            $this->seenKey($viewerId, (int) $authorId),
+            (string) $storyId
+        ));
     }
 }

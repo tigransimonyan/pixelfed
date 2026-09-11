@@ -2,8 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Follower;
-use App\Profile;
+use App\Models\Profile;
+use App\Models\Status;
 use App\Services\AccountService;
 use App\Services\BookmarkService;
 use App\Services\FollowerService;
@@ -16,11 +16,11 @@ use App\Services\RelationshipService;
 use App\Services\SnowflakeService;
 use App\Services\StatusService;
 use App\Services\UserFilterService;
-use App\Status;
 use App\Transformer\Api\StatusStatelessTransformer;
-use Auth;
-use Cache;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Illuminate\Support\Facades\Cache;
 use League\Fractal;
 use League\Fractal\Pagination\IlluminatePaginatorAdapter;
 use League\Fractal\Serializer\ArraySerializer;
@@ -35,7 +35,7 @@ class PublicApiController extends Controller
         $this->fractal->setSerializer(new ArraySerializer);
     }
 
-    public function json($res, $code = 200, $headers = [])
+    public function json($res, $code = 200, $headers = []): JsonResponse
     {
         return response()->json($res, $code, $headers, JSON_UNESCAPED_SLASHES);
     }
@@ -69,7 +69,7 @@ class PublicApiController extends Controller
         abort(404);
     }
 
-    public function status(Request $request, $username, int $postid)
+    public function status(Request $request, $username, int $postid): JsonResponse
     {
         $profile = Profile::whereUsername($username)->whereNull('status')->firstOrFail();
         $status = Status::whereProfileId($profile->id)->findOrFail($postid);
@@ -88,12 +88,12 @@ class PublicApiController extends Controller
         return response()->json($res);
     }
 
-    public function statusState(Request $request, $username, int $postid)
+    public function statusState(Request $request, $username, int $postid): JsonResponse
     {
         $profile = Profile::whereUsername($username)->whereNull('status')->firstOrFail();
         $status = Status::whereProfileId($profile->id)->findOrFail($postid);
         $this->scopeCheck($profile, $status);
-        if (! Auth::check()) {
+        if (! $request->user()) {
             $res = [
                 'user' => [],
                 'likes' => [],
@@ -121,7 +121,7 @@ class PublicApiController extends Controller
         return response()->json($res);
     }
 
-    public function statusComments(Request $request, $username, int $postId)
+    public function statusComments(Request $request, $username, int $postId): JsonResponse
     {
         $this->validate($request, [
             'min_id' => 'nullable|integer|min:1',
@@ -134,8 +134,8 @@ class PublicApiController extends Controller
         $status = Status::whereProfileId($profile->id)->whereCommentsDisabled(false)->findOrFail($postId);
         $this->scopeCheck($profile, $status);
 
-        if (Auth::check()) {
-            $p = Auth::user()->profile;
+        if ($request->user() !== null) {
+            $p = $request->user()->profile;
             $scope = $p->id == $status->profile_id || FollowerService::follows($p->id, $profile->id) ? ['public', 'private', 'unlisted'] : ['public', 'unlisted'];
         } else {
             $scope = ['public', 'unlisted'];
@@ -176,9 +176,9 @@ class PublicApiController extends Controller
         return response()->json($res, 200, [], JSON_PRETTY_PRINT);
     }
 
-    protected function scopeCheck(Profile $profile, Status $status)
+    protected function scopeCheck(Profile $profile, Status $status): void
     {
-        if ($profile->is_private == true && Auth::check() == false) {
+        if ($profile->is_private == true && ! request()->user()) {
             abort(404);
         }
 
@@ -187,7 +187,7 @@ class PublicApiController extends Controller
             case 'unlisted':
                 break;
             case 'private':
-                $user = Auth::check() ? Auth::user() : false;
+                $user = request()->user() !== null ? request()->user() : false;
                 if (! $user) {
                     abort(403);
                 } else {
@@ -212,7 +212,7 @@ class PublicApiController extends Controller
         }
     }
 
-    public function publicTimelineApi(Request $request)
+    public function publicTimelineApi(Request $request): JsonResponse|Response
     {
         $this->validate($request, [
             'page' => 'nullable|integer|max:40',
@@ -389,11 +389,7 @@ class PublicApiController extends Controller
 
         $pid = $user->profile_id;
 
-        $following = Cache::remember('profile:following:'.$pid, 1209600, function () use ($pid) {
-            $following = Follower::whereProfileId($pid)->pluck('following_id');
-
-            return $following->push($pid)->toArray();
-        });
+        $following = FollowerService::getFollowingIds($pid);
 
         $filtered = $user ? UserFilterService::filters($user->profile_id) : [];
         $types = ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'];
@@ -506,7 +502,7 @@ class PublicApiController extends Controller
         }
     }
 
-    public function networkTimelineApi(Request $request)
+    public function networkTimelineApi(Request $request): JsonResponse|Response
     {
         if (! $request->user()) {
             return response('', 403);
@@ -557,12 +553,20 @@ class PublicApiController extends Controller
                     ->get()
                     ->map(function ($s) use ($user) {
                         $status = StatusService::get($s->id);
-                        $status['favourited'] = (bool) LikeService::liked($user->profile_id, $s->id);
-                        $status['bookmarked'] = (bool) BookmarkService::get($user->profile_id, $s->id);
-                        $status['reblogged'] = (bool) ReblogService::get($user->profile_id, $s->id);
+                        if ($status && isset($status['account']) && $user) {
+                            $status['favourited'] = (bool) LikeService::liked($user->profile_id, $s->id);
+                            $status['bookmarked'] = (bool) BookmarkService::get($user->profile_id, $s->id);
+                            $status['reblogged'] = (bool) ReblogService::get($user->profile_id, $s->id);
+                        }
 
                         return $status;
-                    });
+                    })
+                    ->filter(function ($s) {
+                        // Drop statuses whose account failed to resolve (e.g. a
+                        // deleted remote profile) so we never return account=null.
+                        return $s && isset($s['account']);
+                    })
+                    ->values();
                 $res = $timeline->toArray();
             } else {
                 $timeline = Status::select(
@@ -586,12 +590,20 @@ class PublicApiController extends Controller
                     ->get()
                     ->map(function ($s) use ($user) {
                         $status = StatusService::get($s->id);
-                        $status['favourited'] = (bool) LikeService::liked($user->profile_id, $s->id);
-                        $status['bookmarked'] = (bool) BookmarkService::get($user->profile_id, $s->id);
-                        $status['reblogged'] = (bool) ReblogService::get($user->profile_id, $s->id);
+                        if ($status && isset($status['account']) && $user) {
+                            $status['favourited'] = (bool) LikeService::liked($user->profile_id, $s->id);
+                            $status['bookmarked'] = (bool) BookmarkService::get($user->profile_id, $s->id);
+                            $status['reblogged'] = (bool) ReblogService::get($user->profile_id, $s->id);
+                        }
 
                         return $status;
-                    });
+                    })
+                    ->filter(function ($s) {
+                        // Drop statuses whose account failed to resolve (e.g. a
+                        // deleted remote profile) so we never return account=null.
+                        return $s && isset($s['account']);
+                    })
+                    ->values();
                 $res = $timeline->toArray();
             }
         } else {
@@ -632,9 +644,9 @@ class PublicApiController extends Controller
         return response()->json($res);
     }
 
-    public function relationships(Request $request)
+    public function relationships(Request $request): JsonResponse
     {
-        if (! Auth::check()) {
+        if (! $request->user()) {
             return response()->json([]);
         }
 
@@ -655,7 +667,7 @@ class PublicApiController extends Controller
         return response()->json($res);
     }
 
-    public function account(Request $request, $id)
+    public function account(Request $request, $id): JsonResponse
     {
         $res = AccountService::get($id);
         if ($res && isset($res['local'], $res['url']) && ! $res['local']) {
@@ -666,7 +678,7 @@ class PublicApiController extends Controller
         return response()->json($res);
     }
 
-    public function accountStatuses(Request $request, $id)
+    public function accountStatuses(Request $request, $id): JsonResponse
     {
         $this->validate($request, [
             'only_media' => 'nullable',
