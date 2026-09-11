@@ -2,17 +2,18 @@
 
 namespace App\Util\ActivityPub;
 
-use App\Instance;
 use App\Jobs\AvatarPipeline\RemoteAvatarFetch;
 use App\Jobs\HomeFeedPipeline\FeedInsertRemotePipeline;
 use App\Jobs\InstancePipeline\FetchNodeinfoPipeline;
 use App\Jobs\MediaPipeline\MediaStoragePipeline;
 use App\Jobs\StatusPipeline\StatusReplyPipeline;
 use App\Jobs\StatusPipeline\StatusTagsPipeline;
-use App\Media;
+use App\Models\Instance;
+use App\Models\Media;
 use App\Models\ModeratedProfile;
 use App\Models\Poll;
-use App\Profile;
+use App\Models\Profile;
+use App\Models\Status;
 use App\Services\Account\AccountStatService;
 use App\Services\ActivityPubDeliveryService;
 use App\Services\ActivityPubFetchService;
@@ -22,14 +23,14 @@ use App\Services\MediaPathService;
 use App\Services\NetworkTimelineService;
 use App\Services\SanitizeService;
 use App\Services\UserFilterService;
-use App\Status;
 use App\Util\Media\License;
-use Cache;
 use Carbon\Carbon;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use League\Uri\Uri;
 use Purify;
-use Validator;
 
 class Helpers
 {
@@ -42,6 +43,10 @@ class Helpers
     private const FETCH_CACHE_TTL = 15;
 
     private const MAX_URL_LENGTH = 4096;
+
+    private const DNS_TTL_POSITIVE = 86400;
+
+    private const DNS_TTL_NEGATIVE = 300;
 
     private const LOCALHOST_DOMAINS = [
         'localhost',
@@ -79,17 +84,18 @@ class Helpers
             $data = ['object' => $data];
         }
 
-        $activity = $data['object'];
         $mimeTypes = explode(',', config_cache('pixelfed.media_types'));
         $mediaTypes = in_array('video/mp4', $mimeTypes) ?
             ['Document', 'Image', 'Video'] :
             ['Document', 'Image'];
 
-        if (! isset($activity['attachment']) || empty($activity['attachment'])) {
+        $attachments = self::getAttachments($data);
+
+        if (empty($attachments)) {
             return false;
         }
 
-        return Validator::make($activity['attachment'], [
+        return Validator::make($attachments, [
             '*.type' => ['required', 'string', Rule::in($mediaTypes)],
             '*.url' => 'required|url',
             '*.mediaType' => ['required', 'string', Rule::in($mimeTypes)],
@@ -193,20 +199,14 @@ class Helpers
             return false;
         }
 
-        if (empty(self::resolvePublicIps($host))) {
-            return false;
-        }
-
-        if (! $disableDNSCheck && self::shouldCheckDNS()) {
-            if (! self::hasValidDNS($host)) {
-                return false;
-            }
-        }
-
         if ($forceBanCheck || self::shouldCheckBans()) {
             if (self::isHostBanned($host)) {
                 return false;
             }
+        }
+
+        if (empty(self::resolvePublicIps($host))) {
+            return false;
         }
 
         return $uri->toString();
@@ -323,6 +323,33 @@ class Helpers
         return $host;
     }
 
+    private static function lookupPublicIps(string $host): array
+    {
+        $records = @dns_get_record($host.'.', DNS_A | DNS_AAAA);
+
+        if (! is_array($records) || $records === []) {
+            return [];
+        }
+
+        $ips = [];
+
+        foreach ($records as $record) {
+            $ip = $record['ip'] ?? $record['ipv6'] ?? null;
+
+            if (! is_string($ip) || $ip === '' || isset($ips[$ip])) {
+                continue;
+            }
+
+            if (! self::isPublicIp($ip)) {
+                return [];
+            }
+
+            $ips[$ip] = true;
+        }
+
+        return array_keys($ips);
+    }
+
     public static function resolvePublicIps(string $host): array
     {
         $host = self::normalizeHost($host);
@@ -331,47 +358,23 @@ class Helpers
             return [];
         }
 
-        $key = self::URL_CACHE_PREFIX.
-            'public-ips:sha256-'.
-            hash('sha256', $host);
+        $key = self::URL_CACHE_PREFIX.'public-ips:'.hash('xxh128', $host);
 
-        return Cache::remember($key, 60, function () use ($host) {
-            $ips = [];
+        $cached = Cache::get($key);
 
-            $aRecords = @dns_get_record($host.'.', DNS_A);
+        if (is_array($cached)) {
+            return $cached;
+        }
 
-            if (is_array($aRecords)) {
-                foreach ($aRecords as $record) {
-                    if (! empty($record['ip'])) {
-                        $ips[] = $record['ip'];
-                    }
-                }
-            }
+        $ips = self::lookupPublicIps($host);
 
-            $aaaaRecords = @dns_get_record($host.'.', DNS_AAAA);
+        Cache::put(
+            $key,
+            $ips,
+            $ips === [] ? self::DNS_TTL_NEGATIVE : self::DNS_TTL_POSITIVE
+        );
 
-            if (is_array($aaaaRecords)) {
-                foreach ($aaaaRecords as $record) {
-                    if (! empty($record['ipv6'])) {
-                        $ips[] = $record['ipv6'];
-                    }
-                }
-            }
-
-            $ips = array_values(array_unique($ips));
-
-            if (empty($ips)) {
-                return [];
-            }
-
-            foreach ($ips as $ip) {
-                if (! self::isPublicIp($ip)) {
-                    return [];
-                }
-            }
-
-            return $ips;
-        });
+        return $ips;
     }
 
     /**
@@ -432,8 +435,7 @@ class Helpers
      */
     public static function shouldCheckDNS(): bool
     {
-        return app()->environment() === 'production' &&
-            (bool) config('security.url.verify_dns');
+        return app()->environment() === 'production';
     }
 
     /**
@@ -831,7 +833,19 @@ class Helpers
                 in_array($activity['type'], ['Create', 'Note'])) &&
             ! self::validateStatusDomains($id, $url)
         ) {
-            throw new \Exception('Invalid status domains');
+            throw new \Exception(json_encode([
+                'message' => 'Invalid status domains',
+                'checked' => [
+                    'id' => $id,
+                    'id_host' => parse_url($id, PHP_URL_HOST),
+                    'id_valid_url' => self::validateUrl($id),
+                    'url' => $url,
+                    'url_host' => parse_url($url, PHP_URL_HOST),
+                    'url_valid_url' => self::validateUrl($url),
+                ],
+                'expected' => 'id host and url host to be valid and match (case-insensitive)',
+                'payload' => $activity,
+            ]));
         }
 
         $reply_to = self::getReplyTo($activity);
@@ -1018,7 +1032,7 @@ class Helpers
         if ($inReplyTo) {
             $reply_to = self::statusFirstOrFetch($inReplyTo);
             if ($reply_to) {
-                $reply_to = optional($reply_to)->id;
+                $reply_to = $reply_to?->id;
             }
         } else {
             $reply_to = null;
@@ -1139,7 +1153,9 @@ class Helpers
             }
 
             $mediaModel = self::createMediaAttachment($media, $status, $key);
-            self::handleMediaStorage($mediaModel);
+            if ($mediaModel) {
+                self::handleMediaStorage($mediaModel);
+            }
         }
 
         $status->viewType();
@@ -1150,9 +1166,25 @@ class Helpers
      */
     public static function getAttachments(array $data): array
     {
-        return isset($data['object']) ?
-            $data['object']['attachment'] :
-            $data['attachment'];
+        $object = isset($data['object']) ?
+            $data['object'] :
+            $data;
+
+        if (
+            ! is_array($object) ||
+            ! isset($object['attachment']) ||
+            empty($object['attachment']) ||
+            ! is_array($object['attachment'])
+        ) {
+            return [];
+        }
+
+        // JSON-LD compaction can collapse a single-item attachment array into a
+        // bare object. Normalize both shapes to a list so callers can iterate
+        // uniformly (pixelfed#6588).
+        return array_is_list($object['attachment']) ?
+            $object['attachment'] :
+            [$object['attachment']];
     }
 
     /**
@@ -1168,16 +1200,35 @@ class Helpers
     }
 
     /**
-     * Create media attachment record
+     * Create media attachment record.
+     *
+     * Idempotent on the (status_id, media_path) unique key: if a row already
+     * exists (e.g. a re-fetch, an Announce racing another inbox job, or a
+     * duplicate url within one activity's attachments) the existing row is
+     * returned instead of triggering a duplicate-key violation.
+     *
+     * @return Media|null the newly created model, or null when the attachment
+     *                    already existed (so the caller can skip re-storage)
      */
-    public static function createMediaAttachment(array $media, Status $status, int $key): Media
+    public static function createMediaAttachment(array $media, Status $status, int $key): ?Media
     {
+        // Fast path: already imported for this status.
+        if (Media::whereStatusId($status->id)->whereMediaPath($media['url'])->exists()) {
+            return null;
+        }
+
         $mediaModel = new Media;
 
         self::setBasicMediaAttributes($mediaModel, $media, $status, $key);
         self::setOptionalMediaAttributes($mediaModel, $media);
 
-        $mediaModel->save();
+        try {
+            $mediaModel->save();
+        } catch (UniqueConstraintViolationException $e) {
+            // Lost a race with a concurrent inbox job that inserted the same
+            // (status_id, media_path). Treat as already-imported.
+            return null;
+        }
 
         return $mediaModel;
     }
@@ -1382,11 +1433,20 @@ class Helpers
     {
         $profile = Profile::whereRemoteUrl($url)->first();
 
-        if ($profile && ! self::needsFetch($profile)) {
+        if (! $profile) {
+            return self::profileUpdateOrCreate($url);
+        }
+
+        if (! self::needsFetch($profile)) {
             return $profile;
         }
 
-        return self::profileUpdateOrCreate($url);
+        // Attempt a refresh, but fall back to the existing profile if it fails
+        // (network/validation error). Discarding a known-good profile here
+        // caused null dereferences in downstream activity handlers.
+        $refreshed = self::profileUpdateOrCreate($url);
+
+        return $refreshed ?? $profile;
     }
 
     /**
@@ -1449,7 +1509,29 @@ class Helpers
         $urlDomain = parse_url($url, PHP_URL_HOST);
         $domain = parse_url($res['id'], PHP_URL_HOST);
 
-        return strtolower($urlDomain) === strtolower($domain);
+        if (strtolower($urlDomain) !== strtolower($domain)) {
+            return false;
+        }
+
+        // The actor's key_id (publicKey.id) must live on the same host as the
+        // actor id. Without this, a remote actor could advertise a publicKey.id
+        // pointing at a victim's keyId URI, planting a poisoned
+        // key_id -> attacker-public-key binding in the unique profiles.key_id
+        // column. This mirrors the same-host check UpdatePersonValidator already
+        // enforces on the Update pipeline.
+        if (isset($res['publicKey']['id'])) {
+            if (! self::validateUrl($res['publicKey']['id'])) {
+                return false;
+            }
+
+            $keyDomain = parse_url($res['publicKey']['id'], PHP_URL_HOST);
+
+            if (strtolower($keyDomain) !== strtolower($domain)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**
