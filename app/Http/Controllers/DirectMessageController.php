@@ -59,7 +59,7 @@ class DirectMessageController extends Controller
             'is_hidden', 'meta', 'created_at', 'read_at'
         )->with(['author', 'status', 'recipient']);
 
-        if (config('database.default') == 'pgsql') {
+        if (db_is_pgsql()) {
             $query = match ($action) {
                 'inbox' => $baseQuery->whereToId($profile)
                     ->whereIsHidden(false)
@@ -555,7 +555,7 @@ class DirectMessageController extends Controller
         $q = $request->input('q');
         $r = $request->input('remote', false);
 
-        if ($r && ! Str::of($q)->contains('.')) {
+        if ($r && ! Str::contains($q, '.')) {
             return [];
         }
 
@@ -563,7 +563,7 @@ class DirectMessageController extends Controller
             Helpers::profileFetch($q);
         }
 
-        if (Str::of($q)->startsWith('@')) {
+        if (Str::startsWith($q, '@')) {
             if (strlen($q) < 3) {
                 return [];
             }

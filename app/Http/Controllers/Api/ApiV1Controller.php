@@ -81,7 +81,6 @@ use App\Util\Lexer\PrettyNumber;
 use App\Util\Localization\Localization;
 use App\Util\Media\Filter;
 use App\Util\Media\License;
-use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -95,6 +94,7 @@ use Illuminate\Support\Str;
 use Laravel\Passport\Client;
 use League\Fractal;
 use League\Fractal\Serializer\ArraySerializer;
+use Purify;
 
 class ApiV1Controller extends Controller
 {
@@ -373,7 +373,7 @@ class ApiV1Controller extends Controller
         }
 
         if ($request->has('display_name')) {
-            $displayName = $request->input('display_name');
+            $displayName = strip_tags(Purify::clean($request->input('display_name')));
             if ($displayName !== $user->name) {
                 $user->name = $displayName;
                 $profile->name = $displayName;
@@ -2259,7 +2259,20 @@ class ApiV1Controller extends Controller
         $resource = new Fractal\Resource\Item($media, new MediaTransformer);
         $res = $this->fractal->createData($resource)->toArray();
 
-        return $this->json($res);
+        $processing = (bool) config_cache('pixelfed.cloud_storage')
+            && ! config('pixelfed.media_fast_process')
+            && in_array($media->mime, [
+                'image/jpg',
+                'image/jpeg',
+                'image/png',
+                'image/webp',
+                'image/heic',
+                'image/avif',
+                'video/mp4',
+            ])
+            && ! $media->cdn_url;
+
+        return $this->json($res, $processing ? 206 : 200);
     }
 
     /**
@@ -2362,7 +2375,7 @@ class ApiV1Controller extends Controller
                 ->where('created_at', '>', now()->subHours(2))
                 ->find($rpid);
             if ($removeMedia) {
-                $dateTime = Carbon::now();
+                $dateTime = now();
                 MediaDeletePipeline::dispatch($removeMedia)
                     ->onQueue('mmo')
                     ->delay($dateTime->addMinutes(15));
@@ -2771,7 +2784,7 @@ class ApiV1Controller extends Controller
                 })
                 ->values();
 
-            $baseUrl = $napi ? config('app.url').'/api/v1/timelines/home?_pe=1limit='.$limit.'&' : config('app.url').'/api/v1/timelines/home?limit='.$limit.'&';
+            $baseUrl = $napi ? config('app.url').'/api/v1/timelines/home?limit='.$limit.'&_pe=1&' : config('app.url').'/api/v1/timelines/home?limit='.$limit.'&';
             $minId = $res->map(function ($s) {
                 return ['id' => $s['id']];
             })->min('id');
@@ -3314,7 +3327,7 @@ class ApiV1Controller extends Controller
 
         $pid = $user->profile_id;
 
-        $isPgsql = config('database.default') == 'pgsql';
+        $isPgsql = db_is_pgsql();
 
         if ($isPgsql) {
             $dms = DirectMessage::when($scope === 'inbox', function ($q) use ($pid) {
@@ -4113,10 +4126,9 @@ class ApiV1Controller extends Controller
             }
         }
 
-        $defaultCaption = config_cache('database.default') === 'mysql' ? null : '';
         $share = Status::firstOrCreate([
-            'caption' => $defaultCaption,
-            'rendered' => $defaultCaption,
+            'caption' => '',
+            'rendered' => '',
             'profile_id' => $user->profile_id,
             'reblog_of_id' => $status->id,
             'type' => 'share',
@@ -4217,7 +4229,7 @@ class ApiV1Controller extends Controller
             'Invalid permissions for this action'
         );
 
-        if (config('database.default') === 'pgsql') {
+        if (db_is_pgsql()) {
             $tag = Hashtag::where('name', 'ilike', $hashtag)
                 ->orWhere('slug', 'ilike', $hashtag)
                 ->first();
@@ -4478,7 +4490,17 @@ class ApiV1Controller extends Controller
             BookmarkService::del($pid, $status->id);
             $bookmark->delete();
         }
-        $res = StatusService::getMastodon($status->id, false);
+
+        if ($status->scope == 'private') {
+            abort_if(
+                $pid !== $status->profile_id && ! FollowerService::follows($pid, $status->profile_id),
+                404,
+                'Error: You cannot view private posts from accounts you do not follow.'
+            );
+        }
+
+        $res = StatusService::getMastodon($status->id, false, $pid);
+        abort_if(! $res, 404, 'Record does not exist.');
         $res['bookmarked'] = false;
 
         return $this->json($res);

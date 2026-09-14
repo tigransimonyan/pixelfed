@@ -79,11 +79,15 @@ class NetworkTimelineService
 
                 continue;
             }
+            if (! data_get($s, 'account.id')) {
+                self::rem($postId);
+
+                continue;
+            }
             if ($s['account']['id'] == $profileId) {
                 self::rem($postId);
             }
         }
-
     }
 
     public static function warmCache($force = false, $limit = 100)
