@@ -296,6 +296,7 @@ Route::domain(config('pixelfed.domain.app'))->middleware(['localization'])->grou
         Route::post('password', [SettingsController::class, 'passwordUpdate'])->middleware('dangerzone');
         Route::get('email', [SettingsController::class, 'email'])->name('settings.email')->middleware('dangerzone');
         Route::post('email', [SettingsController::class, 'emailUpdate'])->middleware('dangerzone');
+        Route::post('email/resend', [SettingsController::class, 'emailVerificationResend'])->name('settings.email.resend')->middleware(['dangerzone', 'throttle:3,10']);
         Route::get('notifications', [SettingsController::class, 'notifications'])->name('settings.notifications');
         Route::get('privacy', [SettingsController::class, 'privacy'])->name('settings.privacy');
         Route::post('privacy', [SettingsController::class, 'privacyStore']);
@@ -308,7 +309,7 @@ Route::domain(config('pixelfed.domain.app'))->middleware(['localization'])->grou
         Route::post('privacy/blocked-instances', [SettingsController::class, 'blockedInstanceStore']);
         Route::post('privacy/blocked-instances/unblock', [SettingsController::class, 'blockedInstanceUnblock'])->name('settings.privacy.blocked-instances.unblock');
         Route::get('privacy/blocked-keywords', [SettingsController::class, 'blockedKeywords'])->name('settings.privacy.blocked-keywords');
-        Route::post('privacy/account', [SettingsController::class, 'privateAccountOptions'])->name('settings.privacy.account');
+        Route::post('privacy/account', [SettingsController::class, 'privateAccountOptions'])->name('settings.privacy.account')->middleware('dangerzone');
         Route::prefix('remove')->middleware('dangerzone')->group(function () {
             Route::get('request/temporary', [SettingsController::class, 'removeAccountTemporary'])->name('settings.remove.temporary');
             Route::post('request/temporary', [SettingsController::class, 'removeAccountTemporarySubmit']);
@@ -492,6 +493,10 @@ Route::domain(config('pixelfed.domain.app'))->middleware(['localization'])->grou
 
     Route::get('auth/invite/a/{code}', [AdminInviteController::class, 'index']);
     Route::post('api/v1.1/auth/invite/admin/re', [AdminInviteController::class, 'apiRegister'])->middleware('throttle:5,1440');
+
+    // Laravel 13's Horizon no longer redirects the base path to its dashboard,
+    // so /horizon 404s by default. Redirect admins from /horizon to /horizon/dashboard.
+    Route::redirect('horizon', '/horizon/dashboard')->middleware('admin');
 
     Route::redirect('groups/', '/groups/home');
     Route::redirect('groups/home', '/groups/feed');

@@ -18,6 +18,7 @@ use App\Services\FollowerService;
 use App\Services\MediaPathService;
 use App\Services\StoryIndexService;
 use App\Services\StoryService;
+use App\Services\UserFilterService;
 use App\Services\UserRoleService;
 use App\Util\Media\ImageDriverManager;
 use FFMpeg;
@@ -91,16 +92,19 @@ class StoryComposeController extends Controller
         if ($story->type === 'video') {
 
             if ($localFs) {
-                $videoPath = storage_path('app/'.$path);
+                $media = FFMpeg::fromDisk('local')->open($path);
             } else {
-                $tempPath = sys_get_temp_dir().'/'.Str::random(40).'.mp4';
+                $tempName = Str::random(40).'.mp4';
+                $tempPath = sys_get_temp_dir().'/'.$tempName;
                 file_put_contents($tempPath, $disk->get($path));
-                $videoPath = $tempPath;
+                $media = FFMpeg::fromDisk(Storage::build([
+                    'driver' => 'local',
+                    'root' => sys_get_temp_dir(),
+                ]))->open($tempName);
             }
 
             try {
-                $video = FFMpeg::open($videoPath);
-                $duration = $video->getDurationInSeconds();
+                $duration = $media->getDurationInSeconds();
                 $res['media_duration'] = $duration;
 
                 if ($duration > 500) {
@@ -218,7 +222,7 @@ class StoryComposeController extends Controller
 
                 $img = $this->imageManager->decodePath($path);
                 $img = $img->crop($width, $height, $x, $y);
-                $img = $img->coverDown(1080, 1920);
+                $img = $img->cover(1080, 1920);
 
                 if (in_array(strtolower($extension), ['jpg', 'jpeg'])) {
                     $encoder = new JpegEncoder($quality);
@@ -236,7 +240,7 @@ class StoryComposeController extends Controller
 
                 $img = $this->imageManager->decodeBinary($fileContent);
                 $img = $img->crop($width, $height, $x, $y);
-                $img = $img->coverDown(1080, 1920);
+                $img = $img->cover(1080, 1920);
 
                 if (in_array(strtolower($extension), ['jpg', 'jpeg'])) {
                     $encoder = new JpegEncoder($quality);
@@ -395,7 +399,10 @@ class StoryComposeController extends Controller
         $pid = $request->user()->profile_id;
         $ci = $request->input('ci');
         $story = Story::findOrFail($request->input('sid'));
-        abort_if(! FollowerService::follows($pid, $story->profile_id), 403);
+        abort_if(now()->gt($story->expires_at), 404);
+        abort_if($story->profile_id == $pid, 422, 'Cannot vote on your own story');
+        abort_if(! FollowerService::follows($pid, $story->profile_id), 422, 'Cannot vote on a story from an account you do not follow');
+        abort_if(in_array($pid, UserFilterService::blocks($story->profile_id)), 403);
         $poll = Poll::whereStoryId($story->id)->firstOrFail();
 
         $vote = new PollVote;
@@ -448,9 +455,10 @@ class StoryComposeController extends Controller
         abort_if(! in_array($type, $types), 422, 'Invalid story report type');
 
         $story = Story::findOrFail($sid);
-
+        abort_if(now()->gt($story->expires_at), 404);
         abort_if($story->profile_id == $pid, 422, 'Cannot report your own story');
         abort_if(! FollowerService::follows($pid, $story->profile_id), 422, 'Cannot report a story from an account you do not follow');
+        abort_if(in_array($pid, UserFilterService::blocks($story->profile_id)), 403);
 
         if (Report::whereProfileId($pid)
             ->whereObjectType(Story::class)
@@ -488,6 +496,12 @@ class StoryComposeController extends Controller
         $user = $request->user();
         abort_if($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id), 403, 'Invalid permissions for this action');
         $story = Story::findOrFail($request->input('sid'));
+        abort_if(now()->gt($story->expires_at), 404);
+        abort_if(
+            $story->profile_id !== $pid && ! FollowerService::follows($pid, $story->profile_id),
+            403
+        );
+        abort_if(in_array($pid, UserFilterService::blocks($story->profile_id)), 403);
 
         abort_if(! $story->can_react, 422);
         abort_if(StoryService::reactCounter($story->id, $pid) >= 5, 422, 'You have already reacted to this story');
@@ -567,6 +581,12 @@ class StoryComposeController extends Controller
         $user = $request->user();
         abort_if($user->has_roles && ! UserRoleService::can('can-use-stories', $user->id), 403, 'Invalid permissions for this action');
         $story = Story::findOrFail($request->input('sid'));
+        abort_if(now()->gt($story->expires_at), 404);
+        abort_if(
+            $story->profile_id !== $pid && ! FollowerService::follows($pid, $story->profile_id),
+            403
+        );
+        abort_if(in_array($pid, UserFilterService::blocks($story->profile_id)), 403);
 
         abort_if(! $story->can_reply, 422);
 

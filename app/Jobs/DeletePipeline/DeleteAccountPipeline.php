@@ -33,6 +33,7 @@ use App\Models\RemoteReport;
 use App\Models\Report;
 use App\Models\Status;
 use App\Models\StatusArchived;
+use App\Models\StatusEdit;
 use App\Models\StatusHashtag;
 use App\Models\StatusView;
 use App\Models\Story;
@@ -42,6 +43,7 @@ use App\Models\UserDevice;
 use App\Models\UserFilter;
 use App\Models\UserPronoun;
 use App\Models\UserSetting;
+use App\Services\AccountRevocationService;
 use App\Services\AccountService;
 use App\Services\FollowerService;
 use App\Services\PublicTimelineService;
@@ -93,6 +95,7 @@ class DeleteAccountPipeline implements ShouldQueue
 
         $profile = $user->profile;
         $id = $user->profile_id;
+        AccountRevocationService::revokeAll($user);
         $cloudStorageEnabled = (bool) config_cache('pixelfed.cloud_storage');
         $cloudDisk = config('filesystems.cloud');
 
@@ -129,6 +132,10 @@ class DeleteAccountPipeline implements ShouldQueue
         CustomFilter::whereProfileId($id)->delete();
 
         StatusView::whereProfileId($id)->delete();
+
+        // Purge edit history (prior caption/CW versions). status_edits has no
+        // FK/cascade and StatusEdit has no SoftDeletes, so this is a hard delete.
+        StatusEdit::whereProfileId($id)->delete();
 
         ProfileAlias::whereProfileId($id)->delete();
 

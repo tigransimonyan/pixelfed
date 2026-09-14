@@ -27,7 +27,6 @@ use App\Services\NotificationService;
 use App\Services\PublicTimelineService;
 use App\Services\StatusService;
 use App\Util\ActivityPub\Helpers;
-use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -142,7 +141,7 @@ trait AdminReportController
         });
 
         $avg = Cache::remember('admin-dash:reports:spam-count:avg', 43200, function () {
-            if (config('database.default') != 'mysql') {
+            if (! db_is_mysql_maria()) {
                 return 0;
             }
 
@@ -154,7 +153,7 @@ trait AdminReportController
         });
 
         $avgOpen = Cache::remember('admin-dash:reports:spam-count:avgopen', 43200, function () {
-            if (config('database.default') != 'mysql') {
+            if (! db_is_mysql_maria()) {
                 return '0';
             }
             $seconds = AccountInterstitial::selectRaw('DATE(created_at) AS start_date, AVG(TIME_TO_SEC(TIMEDIFF(appeal_handled_at, created_at))) AS timediff')->whereType('post.autospam')->whereNotNull('appeal_handled_at')->where('created_at', '>', now()->subMonth())->get();
@@ -495,7 +494,7 @@ trait AdminReportController
     public function handleReportAction(Report $report, $action)
     {
         $item = $report->reported();
-        $report->admin_seen = Carbon::now();
+        $report->admin_seen = now();
 
         switch ($action) {
             case 'ignore':

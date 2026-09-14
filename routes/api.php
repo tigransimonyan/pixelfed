@@ -381,6 +381,11 @@ Route::prefix('api')->group(function () use ($middleware) {
         Route::post('instances/moderate', [AdminApiController::class, 'moderateInstance'])->middleware($middleware);
         Route::post('instances/refresh-stats', [AdminApiController::class, 'refreshInstanceStats'])->middleware($middleware);
         Route::get('instance/stats', [AdminApiController::class, 'getAllStats'])->middleware($middleware);
+        Route::get('posts/list', [AdminApiController::class, 'getPosts'])->middleware($middleware);
+        Route::get('posts/get', [AdminApiController::class, 'getPost'])->middleware($middleware);
+        Route::get('profiles/list', [AdminApiController::class, 'getProfiles'])->middleware($middleware);
+        Route::get('profiles/get', [AdminApiController::class, 'getProfile'])->middleware($middleware);
+        Route::post('profiles/moderate', [AdminApiController::class, 'moderateProfile'])->middleware($middleware);
     });
 
     Route::prefix('landing/v1')->group(function () {
