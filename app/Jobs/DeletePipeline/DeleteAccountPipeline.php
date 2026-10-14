@@ -125,7 +125,13 @@ class DeleteAccountPipeline implements ShouldQueue
             }
         }
 
-        Status::whereProfileId($id)->chunk(50, function ($statuses) {
+        // chunkById, not chunk: StatusDelete soft-deletes the rows it is
+        // handed, so OFFSET paging would skip half the set as the live rows
+        // shift under it. Keyset paging on the monotonic id is stable.
+        // chunkById, not chunk: StatusDelete soft-deletes the rows it is
+        // handed, so OFFSET paging would skip half the set as the live rows
+        // shift under it. Keyset paging on the monotonic id is stable.
+        Status::whereProfileId($id)->chunkById(50, function ($statuses) {
             foreach ($statuses as $status) {
                 StatusDelete::dispatch($status);
             }
@@ -197,7 +203,7 @@ class DeleteAccountPipeline implements ShouldQueue
         });
 
         UserDevice::whereUserId($user->id)->forceDelete();
-        UserFilter::whereUserId($user->id)->forceDelete();
+        UserFilter::whereUserId($id)->forceDelete();
         FeatureAuthorization::whereProfileId($id)->delete();
         QuoteAuthorization::whereProfileId($id)->delete();
         UserSetting::whereUserId($user->id)->forceDelete();

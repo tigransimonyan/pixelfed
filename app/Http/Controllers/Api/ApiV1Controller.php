@@ -64,6 +64,7 @@ use App\Services\MediaPathService;
 use App\Services\MediaService;
 use App\Services\NetworkTimelineService;
 use App\Services\NotificationService;
+use App\Services\PlaceService;
 use App\Services\PublicTimelineService;
 use App\Services\QuoteService;
 use App\Services\ReblogService;
@@ -75,6 +76,7 @@ use App\Services\StoryIndexService;
 use App\Services\UserFilterService;
 use App\Services\UserRoleService;
 use App\Services\UserStorageService;
+use App\Support\CursorToken;
 use App\Transformer\Api\Mastodon\v1\MediaTransformer;
 use App\Transformer\Api\Mastodon\v1\StatusTransformer;
 use App\Transformer\Api\RelationshipTransformer;
@@ -243,25 +245,28 @@ class ApiV1Controller extends Controller
             'acct' => 'required|string|min:3|max:100',
         ]);
 
-        $acct = $request->acct;
+        $acct = ltrim(trim($request->acct), '@');
+        $parts = explode('@', $acct);
 
-        if (str_contains($acct, '@')) {
-            $count = mb_substr_count($acct, '@');
-
-            if ($count === 1) {
-                if (str_starts_with($acct, '@')) {
-                    $acct = substr($acct, 1);
-                } else {
-                    $acct = '@'.$acct;
-                }
-            }
-            if ($count > 2) {
-                return $this->json(['error' => 'Record not found'], 400);
-            }
+        if (count($parts) > 2 || $parts[0] === '') {
+            return $this->json(['error' => 'Record not found'], 400);
         }
-        $profile = Profile::whereUsername($acct)->first();
 
-        if (! $profile) {
+        $username = $parts[0];
+        $domain = isset($parts[1]) ? strtolower($parts[1]) : null;
+        $localDomain = strtolower((string) parse_url(config('app.url'), PHP_URL_HOST));
+
+        if ($domain === '') {
+            return $this->json(['error' => 'Record not found'], 400);
+        }
+
+        $lookup = ($domain === null || $domain === $localDomain)
+            ? $username
+            : '@'.$username.'@'.$domain;
+
+        $profile = Profile::whereUsername($lookup)->first();
+
+        if (! $profile || $profile->status != null) {
             return $this->json(['error' => 'Record not found'], 400);
         }
 
@@ -269,7 +274,7 @@ class ApiV1Controller extends Controller
         if (! $res) {
             return response()->json(['error' => 'Record not found'], 404);
         }
-        if ($res && strpos($res['acct'], '@') != -1) {
+        if (str_contains($res['acct'], '@')) {
             $domain = parse_url($res['url'], PHP_URL_HOST);
             abort_if(in_array($domain, InstanceService::getBannedDomains()), 404);
         }
@@ -331,8 +336,8 @@ class ApiV1Controller extends Controller
             $changes = true;
         }
 
-        if ($request->has('source[language]')) {
-            $lang = $request->input('source[language]');
+        if ($request->has('source.language')) {
+            $lang = $request->input('source.language');
             if (in_array($lang, Localization::languages())) {
                 $user->language = $lang;
                 $changes = true;
@@ -366,7 +371,12 @@ class ApiV1Controller extends Controller
         }
 
         if ($request->has('display_name')) {
-            $displayName = strip_tags(Purify::clean($request->input('display_name')));
+            // Purify entity-encodes &, <, > even in plain text; decode after the
+            // tag/XSS strip so the display name is stored as readable text.
+            $displayName = htmlspecialchars_decode(
+                strip_tags(Purify::clean($request->input('display_name'))),
+                ENT_QUOTES | ENT_HTML5
+            );
             if ($displayName !== $user->name) {
                 $user->name = $displayName;
                 $profile->name = $displayName;
@@ -468,8 +478,8 @@ class ApiV1Controller extends Controller
             }
         }
 
-        if ($request->has('source[privacy]')) {
-            $scope = $request->input('source[privacy]');
+        if ($request->has('source.privacy')) {
+            $scope = $request->input('source.privacy');
             if (in_array($scope, ['public', 'private', 'unlisted'])) {
                 if ($composeSettings['default_scope'] != $scope) {
                     $composeSettings['default_scope'] = $profile->is_private ? 'private' : $scope;
@@ -804,6 +814,10 @@ class ApiV1Controller extends Controller
 
         if (! $profile || ! isset($profile['id'])) {
             return $this->json(['error' => 'Account not found'], 404);
+        }
+
+        if (data_get($profile, 'moved.id') != null) {
+            return $this->json([]);
         }
 
         if (str_contains($profile['acct'] ?? '', '@')) {
@@ -2622,337 +2636,200 @@ class ApiV1Controller extends Controller
         ]);
 
         $napi = $request->has(self::PF_API_ENTITY_KEY);
-        $page = $request->input('page');
         $min = $request->input('min_id');
         $max = $request->input('max_id');
-        $limit = $request->input('limit') ?? 20;
-        if ($limit > 40) {
-            $limit = 40;
-        }
+        $limit = min((int) ($request->input('limit') ?? 20), 40);
         $pid = $request->user()->profile_id;
-        $userSettings = $request->user()->settings;
-        $other = $userSettings->other ?? [];
+        $other = $request->user()->settings->other ?? [];
 
-        $userEnableReblogs = data_get($other, 'enable_reblogs', false);
-        $includeReblogs = $request->filled('include_reblogs') ? $request->boolean('include_reblogs') : $userEnableReblogs;
-
-        $nullFields = $includeReblogs ?
-            ['in_reply_to_id'] :
-            ['in_reply_to_id', 'reblog_of_id'];
-        $inTypes = $includeReblogs ?
-            ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album', 'share'] :
-            ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'];
+        $includeReblogs = $request->filled('include_reblogs')
+            ? $request->boolean('include_reblogs')
+            : (bool) data_get($other, 'enable_reblogs', false);
 
         // "Photo reblogs only"
         $photosReblogsOnly = $request->filled('photos_reblogs_only')
             ? $request->boolean('photos_reblogs_only')
-            : data_get($other, 'photo_reblogs_only', false);
-        $reblogTargetTypes = array_diff($inTypes, ['share']);
+            : (bool) data_get($other, 'photo_reblogs_only', false);
 
-        // Filtering happens after the fetch, so fetch deeper to fill a page
-        $fetchLimit = $photosReblogsOnly ? $limit * 6 : $limit * 2;
+        // Mirrors the StatusService lift condition: these clients render a boost
+        // from the top level, so the original author has to be lifted with the content
+        $liftReblogAuthor = $napi && $includeReblogs && ! $request->filled('include_reblogs');
+
+        $postTypes = ['photo', 'photo:album', 'video', 'video:album', 'photo:video:album'];
+        $inTypes = $includeReblogs ? [...$postTypes, 'share'] : $postTypes;
 
         AccountService::setLastActive($request->user()->id);
 
-        $cachedFilters = CustomFilter::getCachedFiltersForAccount($pid);
+        $homeFilters = array_filter(
+            CustomFilter::getCachedFiltersForAccount($pid),
+            function ($item) {
+                [$filter, $rules] = $item;
 
-        $homeFilters = array_filter($cachedFilters, function ($item) {
-            [$filter, $rules] = $item;
+                return in_array('home', $filter->context);
+            }
+        );
 
-            return in_array('home', $filter->context);
-        });
+        $cached = (bool) config('exp.cached_home_timeline');
 
-        if (config('exp.cached_home_timeline')) {
+        if ($cached) {
             $paddedLimit = $includeReblogs ? $limit + 10 : $limit + 50;
+
             if ($min || $max) {
-                if ($request->has('min_id')) {
-                    $res = HomeTimelineService::getRankedMinId($pid, $min ?? 0, $paddedLimit);
-                } else {
-                    $res = HomeTimelineService::getRankedMaxId($pid, $max ?? 0, $paddedLimit);
-                }
+                $ids = $request->has('min_id')
+                    ? HomeTimelineService::getRankedMinId($pid, $min ?? 0, $paddedLimit)
+                    : HomeTimelineService::getRankedMaxId($pid, $max ?? 0, $paddedLimit);
             } else {
-                $res = HomeTimelineService::get($pid, 0, $paddedLimit);
+                $ids = HomeTimelineService::get($pid, 0, $paddedLimit);
             }
 
-            if (! $res) {
-                $res = Cache::has('pf:services:apiv1:home:cached:coldbootcheck:'.$pid);
-                if (! $res) {
-                    Cache::set('pf:services:apiv1:home:cached:coldbootcheck:'.$pid, 1, 86400);
+            if (! $ids) {
+                $coldBootKey = 'pf:services:apiv1:home:cached:coldbootcheck:'.$pid;
+
+                if (! Cache::has($coldBootKey)) {
+                    Cache::set($coldBootKey, 1, 86400);
                     FeedWarmCachePipeline::dispatchSync($pid);
 
                     return response()->json([], 206);
                 }
-                Cache::set('pf:services:apiv1:home:cached:coldbootcheck:'.$pid, 1, 86400);
+
+                Cache::set($coldBootKey, 1, 86400);
 
                 return response()->json([], 206);
             }
-
-            $res = collect($res)
-                ->map(function ($id) use ($napi) {
-                    return $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
-                })
-                ->filter(function ($res) {
-                    return $res && isset($res['account']);
-                })
-                ->filter(function ($s) use ($includeReblogs) {
-                    return $includeReblogs ? true : $s['reblog'] == null;
-                })
-                ->map(function ($status) use ($homeFilters) {
-                    $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
-
-                    if (! empty($filterResults)) {
-                        $status['filtered'] = $filterResults;
-                        $shouldHide = collect($filterResults)->contains(function ($result) {
-                            return $result['filter']['filter_action'] === 'hide';
-                        });
-
-                        if ($shouldHide) {
-                            return null;
-                        }
-                    }
-
-                    return $status;
-                })
-                ->filter()
-                ->take($limit)
-                ->map(function ($status) use ($pid) {
-                    if ($pid) {
-                        $status['favourited'] = (bool) LikeService::liked($pid, $status['id']);
-                        $status['reblogged'] = (bool) ReblogService::get($pid, $status['id']);
-                        $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
-                    }
-
-                    return $status;
-                })
-                ->values();
-
-            $baseUrl = $napi ? config('app.url').'/api/v1/timelines/home?limit='.$limit.'&_pe=1&' : config('app.url').'/api/v1/timelines/home?limit='.$limit.'&';
-            $minId = $res->map(function ($s) {
-                return ['id' => $s['id']];
-            })->min('id');
-            $maxId = $res->map(function ($s) {
-                return ['id' => $s['id']];
-            })->max('id');
-
-            if ($minId == $maxId) {
-                $minId = null;
-            }
-
-            if ($maxId && $res->count() >= $limit) {
-                $link = '<'.$baseUrl.'max_id='.$minId.'>; rel="next"';
-            }
-
-            if ($minId) {
-                $link = '<'.$baseUrl.'min_id='.$maxId.'>; rel="prev"';
-            }
-
-            if ($maxId && $minId) {
-                $link = '<'.$baseUrl.'max_id='.$minId.'>; rel="next",<'.$baseUrl.'min_id='.$maxId.'>; rel="prev"';
-            }
-
-            $headers = isset($link) ? ['Link' => $link] : [];
-
-            return $this->json($res->toArray(), 200, $headers);
-        }
-
-        $following = FollowerService::getFollowingIds($pid);
-
-        $muted = UserFilterService::mutes($pid);
-
-        if ($muted && count($muted)) {
-            $following = array_diff($following, $muted);
-        }
-
-        if ($min || $max) {
-            $dir = $min ? '>' : '<';
-            $id = $min ?? $max;
-            $res = Status::select(
-                'id',
-                'profile_id',
-                'type',
-                'visibility',
-                'in_reply_to_id',
-                'reblog_of_id'
-            )
-                ->where('id', $dir, $id)
-                ->whereNull($nullFields)
-                ->whereIntegerInRaw('profile_id', $following)
-                ->whereIn('type', $inTypes)
-                ->whereIn('visibility', ['public', 'unlisted', 'private'])
-                ->orderByDesc('id')
-                ->take($fetchLimit)
-                ->get()
-                ->map(function ($s) use ($pid, $napi) {
-                    try {
-                        $account = $napi ? AccountService::get($s['profile_id'], true) : AccountService::getMastodon($s['profile_id'], true);
-                        if (! $account) {
-                            return false;
-                        }
-                        $status = $napi ? StatusService::get($s['id'], false) : StatusService::getMastodon($s['id'], false);
-                        if (! $status || ! isset($status['account']) || ! isset($status['account']['id'])) {
-                            return false;
-                        }
-                    } catch (\Exception) {
-                        return false;
-                    }
-
-                    // Not $status['account'] = $account: $account is resolved from
-                    // the row, StatusService picks the right one per client
-
-                    if ($pid) {
-                        $status['favourited'] = (bool) LikeService::liked($pid, $s['id']);
-                        $status['reblogged'] = (bool) ReblogService::get($pid, $status['id']);
-                        $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
-                    }
-
-                    return $status;
-                })
-                ->filter(function ($status) use ($photosReblogsOnly, $reblogTargetTypes) {
-                    if (! $status || ! isset($status['account'])) {
-                        return false;
-                    }
-
-                    // direct posts pass; a boost must share a photo or video
-                    return ! $photosReblogsOnly
-                        || empty($status['reblog'])
-                        || in_array(data_get($status['reblog'], 'pf_type'), $reblogTargetTypes);
-                })
-                ->map(function ($status) use ($pid) {
-                    if (! empty($status['reblog'])) {
-                        $status['reblog']['favourited'] = (bool) LikeService::liked($pid, $status['reblog']['id']);
-                        $status['reblog']['reblogged'] = (bool) ReblogService::get($pid, $status['reblog']['id']);
-                        $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
-                    }
-
-                    return $status;
-                })
-                ->map(function ($status) use ($homeFilters) {
-                    $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
-
-                    if (! empty($filterResults)) {
-                        $status['filtered'] = $filterResults;
-                        $shouldHide = collect($filterResults)->contains(function ($result) {
-                            return $result['filter']['filter_action'] === 'hide';
-                        });
-
-                        if ($shouldHide) {
-                            return null;
-                        }
-                    }
-
-                    return $status;
-                })
-                ->filter()
-                ->take($limit)
-                ->values();
         } else {
-            $res = Status::select(
-                'id',
-                'profile_id',
-                'type',
-                'visibility',
-                'in_reply_to_id',
-                'reblog_of_id',
-            )
-                ->whereNull($nullFields)
+            $following = FollowerService::getFollowingIds($pid);
+            $muted = UserFilterService::mutes($pid);
+
+            if ($muted && count($muted)) {
+                $following = array_diff($following, $muted);
+            }
+
+            // Filtering happens after the fetch, so fetch deeper to fill a page
+            $fetchLimit = $photosReblogsOnly ? $limit * 6 : $limit * 2;
+
+            $ids = Status::query()
+                ->when($min || $max, function ($q) use ($min, $max) {
+                    return $q->where('id', $min ? '>' : '<', $min ?: $max);
+                })
+                ->whereNull($includeReblogs ? ['in_reply_to_id'] : ['in_reply_to_id', 'reblog_of_id'])
                 ->whereIntegerInRaw('profile_id', $following)
                 ->whereIn('type', $inTypes)
                 ->whereIn('visibility', ['public', 'unlisted', 'private'])
                 ->orderByDesc('id')
                 ->take($fetchLimit)
-                ->get()
-                ->map(function ($s) use ($pid, $napi) {
-                    try {
-                        $account = $napi ? AccountService::get($s['profile_id'], true) : AccountService::getMastodon($s['profile_id'], true);
-                        if (! $account) {
-                            return false;
-                        }
-                        $status = $napi ? StatusService::get($s['id'], false) : StatusService::getMastodon($s['id'], false);
-                        if (! $status || ! isset($status['account']) || ! isset($status['account']['id'])) {
-                            return false;
-                        }
-                    } catch (\Exception) {
-                        return false;
-                    }
-
-                    // Not $status['account'] = $account: $account is resolved from
-                    // the row, StatusService picks the right one per client
-
-                    if ($pid) {
-                        $status['favourited'] = (bool) LikeService::liked($pid, $s['id']);
-                        $status['reblogged'] = (bool) ReblogService::get($pid, $status['id']);
-                        $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
-                    }
-
-                    return $status;
-                })
-                ->filter(function ($status) use ($photosReblogsOnly, $reblogTargetTypes) {
-                    if (! $status || ! isset($status['account'])) {
-                        return false;
-                    }
-
-                    // direct posts pass; a boost must share a photo or video
-                    return ! $photosReblogsOnly
-                        || empty($status['reblog'])
-                        || in_array(data_get($status['reblog'], 'pf_type'), $reblogTargetTypes);
-                })
-                ->map(function ($status) use ($pid) {
-                    if (! empty($status['reblog'])) {
-                        $status['reblog']['favourited'] = (bool) LikeService::liked($pid, $status['reblog']['id']);
-                        $status['reblog']['reblogged'] = (bool) ReblogService::get($pid, $status['reblog']['id']);
-                        $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
-                    }
-
-                    return $status;
-                })
-                ->map(function ($status) use ($homeFilters) {
-                    $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
-
-                    if (! empty($filterResults)) {
-                        $status['filtered'] = $filterResults;
-                        $shouldHide = collect($filterResults)->contains(function ($result) {
-                            return $result['filter']['filter_action'] === 'hide';
-                        });
-
-                        if ($shouldHide) {
-                            return null;
-                        }
-                    }
-
-                    return $status;
-                })
-                ->filter()
-                ->take($limit)
-                ->values();
+                ->pluck('id');
         }
 
-        $baseUrl = $napi ? config('app.url').'/api/v1/timelines/home?limit='.$limit.'&_pe=1&' : config('app.url').'/api/v1/timelines/home?limit='.$limit.'&';
-        $minId = $res->map(function ($s) {
-            return ['id' => $s['id']];
-        })->min('id');
-        $maxId = $res->map(function ($s) {
-            return ['id' => $s['id']];
-        })->max('id');
+        // The cached feed has never applied photo_reblogs_only; kept as-is
+        $applyPhotosReblogsOnly = ! $cached && $photosReblogsOnly;
 
-        if ($minId == $maxId) {
-            $minId = null;
+        $res = collect($ids)
+            ->map(function ($id) use ($napi) {
+                try {
+                    $status = $napi ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
+                } catch (\Exception) {
+                    return null;
+                }
+
+                return isset($status['account']['id']) ? $status : null;
+            })
+            ->filter()
+            ->filter(function ($status) use ($includeReblogs, $applyPhotosReblogsOnly, $postTypes) {
+                if (empty($status['reblog'])) {
+                    return true;
+                }
+
+                if (! $includeReblogs) {
+                    return false;
+                }
+
+                // a boost must share a photo or video
+                return ! $applyPhotosReblogsOnly
+                    || in_array(data_get($status['reblog'], 'pf_type'), $postTypes);
+            })
+            ->map(function ($status) use ($homeFilters) {
+                $filterResults = CustomFilter::applyCachedFilters($homeFilters, $status);
+
+                if (! empty($filterResults)) {
+                    $status['filtered'] = $filterResults;
+                    $shouldHide = collect($filterResults)->contains(function ($result) {
+                        return $result['filter']['filter_action'] === 'hide';
+                    });
+
+                    if ($shouldHide) {
+                        return null;
+                    }
+                }
+
+                return $status;
+            })
+            ->filter()
+            ->take($limit)
+            ->map(function ($status) use ($pid) {
+                $status['favourited'] = (bool) LikeService::liked($pid, $status['id']);
+                $status['reblogged'] = (bool) ReblogService::get($pid, $status['id']);
+                $status['bookmarked'] = (bool) BookmarkService::get($pid, $status['id']);
+
+                if (! empty($status['reblog'])) {
+                    $status['reblog']['favourited'] = (bool) LikeService::liked($pid, $status['reblog']['id']);
+                    $status['reblog']['reblogged'] = (bool) ReblogService::get($pid, $status['reblog']['id']);
+                    $status['reblog']['bookmarked'] = (bool) BookmarkService::get($pid, $status['reblog']['id']);
+                }
+
+                return $status;
+            })
+            ->map(function ($status) use ($liftReblogAuthor) {
+                return $liftReblogAuthor ? $this->liftReblogAuthor($status) : $status;
+            })
+            ->values();
+
+        $headers = [];
+
+        if ($res->isNotEmpty()) {
+            $baseUrl = config('app.url').'/api/v1/timelines/home?limit='.$limit.'&'.($napi ? '_pe=1&' : '');
+            $pageIds = $res->pluck('id');
+
+            $headers['Link'] = '<'.$baseUrl.'max_id='.$pageIds->min().'>; rel="next",<'.$baseUrl.'min_id='.$pageIds->max().'>; rel="prev"';
         }
-
-        if ($maxId) {
-            $link = '<'.$baseUrl.'max_id='.$minId.'>; rel="next"';
-        }
-
-        if ($minId) {
-            $link = '<'.$baseUrl.'min_id='.$maxId.'>; rel="prev"';
-        }
-
-        if ($maxId && $minId) {
-            $link = '<'.$baseUrl.'max_id='.$minId.'>; rel="next",<'.$baseUrl.'min_id='.$maxId.'>; rel="prev"';
-        }
-
-        $headers = isset($link) ? ['Link' => $link] : [];
 
         return $this->json($res->toArray(), 200, $headers);
+    }
+
+    /**
+     * StatusService lifts a boost's content to the top level for _pe clients
+     * that don't send include_reblogs. In the home feed those clients render
+     * the card from the top level alone, so the author, counts and viewer
+     * state must come from the shared post too. Actions on the card resolve
+     * to that post (resolveReblogTargetId), so the state has to match it.
+     * Scoped to the home timeline: profile feeds and single-status views
+     * keep the booster.
+     */
+    protected function liftReblogAuthor(array $status): array
+    {
+        if (empty($status['reblog']['account'])) {
+            return $status;
+        }
+
+        $status['reblogged_by'] = $status['account'];
+
+        foreach (
+            [
+                'account',
+                'favourites_count',
+                'reblogs_count',
+                'reply_count',
+                'liked_by',
+                'favourited',
+                'reblogged',
+                'bookmarked',
+            ] as $key
+        ) {
+            if (array_key_exists($key, $status['reblog'])) {
+                $status[$key] = $status['reblog'][$key];
+            }
+        }
+
+        return $status;
     }
 
     /**
@@ -3370,7 +3247,7 @@ class ApiV1Controller extends Controller
         abort_unless($request->user()->tokenCan('write'), 403);
 
         $service = app(DirectMessageService::class);
-        $found = is_numeric($id) ? $service->conversationFor($id, $request->user()->profile_id) : null;
+        $found = is_numeric($id) ? $service->conversationForMastodonId($id, $request->user()->profile_id) : null;
         abort_if(! $found, 404);
 
         $service->setHidden($found[1], true);
@@ -3390,7 +3267,7 @@ class ApiV1Controller extends Controller
         $payloads = app(DirectMessagePayloadService::class);
         $pid = $request->user()->profile_id;
 
-        $found = is_numeric($id) ? $service->conversationFor($id, $pid) : null;
+        $found = is_numeric($id) ? $service->conversationForMastodonId($id, $pid) : null;
         abort_if(! $found, 404);
 
         [$conversation, $participant] = $found;
@@ -3425,6 +3302,14 @@ class ApiV1Controller extends Controller
 
         $res = $request->has(self::PF_API_ENTITY_KEY) ? StatusService::get($id, false) : StatusService::getMastodon($id, false);
         if (! $res || ! isset($res['visibility'])) {
+            // Direct messages are no longer statuses, but clients still take
+            // the id they got from /api/v1/conversations to this endpoint
+            $direct = app(DirectMessagePayloadService::class)->mastodonStatusById($id, $pid);
+
+            if ($direct) {
+                return $this->json($direct);
+            }
+
             abort(404);
         }
 
@@ -3478,6 +3363,12 @@ class ApiV1Controller extends Controller
         );
 
         if (! $status || ! isset($status['account'])) {
+            $direct = app(DirectMessagePayloadService::class)->mastodonContext($id, $pid);
+
+            if ($direct) {
+                return $this->json($direct);
+            }
+
             return response('', 404);
         }
 
@@ -3525,28 +3416,36 @@ class ApiV1Controller extends Controller
         }
 
         if ($status['replies_count']) {
+            $parentOwnerId = $status['account']['id'];
+            $parentScope = $status['visibility'];
+
             $descendants = DB::table('statuses')
+                ->select(['id', 'profile_id', 'scope', 'local'])
                 ->where('in_reply_to_id', $id)
-                ->limit(20)
-                ->pluck('id')
-                ->map(function ($sid) use ($pe, $pid) {
-                    return $pe
-                        ? StatusService::get(
-                            $sid,
-                            false,
-                            false,
-                            $pid
-                        )
-                        : StatusService::getMastodon(
-                            $sid,
-                            false,
+                ->whereNull('deleted_at')
+                ->whereIn('scope', ['public', 'unlisted', 'private'])
+                ->orderBy('id')
+                ->limit(100)
+                ->get()
+                ->filter(function ($row) use ($filters, $pid, $parentOwnerId, $parentScope) {
+                    return ! in_array($row->profile_id, $filters) &&
+                        StatusService::isReplyVisibleTo(
+                            $row->profile_id,
+                            $row->scope,
+                            $row->local,
+                            $parentOwnerId,
+                            $parentScope,
                             $pid
                         );
                 })
-                ->filter(function ($post) use ($filters) {
-                    return $post &&
-                        isset($post['account']['id']) &&
-                        ! in_array($post['account']['id'], $filters);
+                ->take(20)
+                ->map(function ($row) use ($pe) {
+                    return $pe
+                        ? StatusService::get($row->id, false)
+                        : StatusService::getMastodon($row->id, false);
+                })
+                ->filter(function ($post) {
+                    return $post && isset($post['account']['id']);
                 })
                 ->map(function ($status) use ($pid) {
                     $status['favourited'] = LikeService::liked(
@@ -3803,6 +3702,7 @@ class ApiV1Controller extends Controller
             'collection_ids' => 'sometimes|array|max:3',
             'comments_disabled' => 'sometimes|boolean',
             'quote_approval_policy' => 'sometimes|nullable|string|in:public,followers,nobody',
+            '_pe' => 'sometimes',
         ]);
 
         if ($request->filled('visibility') && $request->input('visibility') === 'direct') {
@@ -3811,11 +3711,66 @@ class ApiV1Controller extends Controller
             ], 400);
         }
 
+        $pe = $request->has(self::PF_API_ENTITY_KEY);
+        $idempotencyKey = null;
+
         if ($request->hasHeader('idempotency-key')) {
-            $key = 'pf:api:v1:status:idempotency-key:'.$request->user()->id.':'.hash('sha1', $request->header('idempotency-key'));
-            $exists = Cache::has($key);
-            abort_if($exists, 400, 'Duplicate idempotency key.');
-            Cache::put($key, 1, 3600);
+            $idempotencyKey = 'pf:api:v1:status:idempotency-key:'.$request->user()->id.':'.hash('sha1', $request->header('idempotency-key'));
+
+            $existing = Cache::get($idempotencyKey);
+            if (is_numeric($existing)) {
+                $res = $pe ? StatusService::get($existing, false) : StatusService::getMastodon($existing, false);
+                if ($res) {
+                    return $this->json($this->decorateNewStatus($res));
+                }
+                Cache::forget($idempotencyKey);
+            }
+
+            abort_unless(Cache::add($idempotencyKey, 'pending', 60), 409, 'Request already in progress.');
+        }
+
+        try {
+            return $this->storeStatus($request, $pe, $idempotencyKey);
+        } finally {
+            if ($idempotencyKey && Cache::get($idempotencyKey) === 'pending') {
+                Cache::forget($idempotencyKey);
+            }
+        }
+    }
+
+    protected function decorateNewStatus(array $res): array
+    {
+        $res['favourited'] = false;
+        $res['language'] = 'en';
+        $res['bookmarked'] = false;
+        $res['card'] = null;
+
+        return $res;
+    }
+
+    protected function storeStatus(Request $request, bool $pe, ?string $idempotencyKey)
+    {
+        abort_if(! $request->user() || ! $request->user()->token(), 403);
+        abort_unless($request->user()->tokenCan('write'), 403);
+
+        $this->validate($request, [
+            'status' => 'nullable|string|max:'.(int) config_cache('pixelfed.max_caption_length'),
+            'in_reply_to_id' => 'nullable',
+            'media_ids' => 'sometimes|array|max:'.(int) config_cache('pixelfed.max_album_length'),
+            'sensitive' => 'nullable',
+            'visibility' => 'string|in:private,unlisted,public,direct',
+            'spoiler_text' => 'sometimes|max:140',
+            'place_id' => 'sometimes|integer|min:1|max:128769',
+            'collection_ids' => 'sometimes|array|max:3',
+            'comments_disabled' => 'sometimes|boolean',
+            'quote_approval_policy' => 'sometimes|nullable|string|in:public,followers,nobody',
+            '_pe' => 'sometimes',
+        ]);
+
+        if ($request->filled('visibility') && $request->input('visibility') === 'direct') {
+            return $this->json([
+                'error' => 'Direct visibility is not available.',
+            ], 400);
         }
 
         if (config('costar.enabled') == true) {
@@ -3848,7 +3803,6 @@ class ApiV1Controller extends Controller
         }
 
         $profile = $user->profile;
-
         $limitKey = 'compose:rate-limit:store:'.$user->id;
         $limitTtl = now()->addMinutes(15);
         $limitReached = Cache::remember($limitKey, $limitTtl, function () use ($user) {
@@ -3942,6 +3896,7 @@ class ApiV1Controller extends Controller
                 $status->visibility = 'draft';
                 if ($request->has('place_id')) {
                     $status->place_id = $request->input('place_id');
+                    PlaceService::clearStatusesByPlaceId($request->input('place_id'));
                 }
                 $status->save();
             }
@@ -3982,6 +3937,9 @@ class ApiV1Controller extends Controller
             abort(500, 'An error occured.');
         }
 
+        if ($idempotencyKey) {
+            Cache::put($idempotencyKey, $status->id, 3600);
+        }
         Cache::forget('pf:status:ap:v1:sid:'.$status->id);
         Cache::forget('status:transformer:media:attachments:'.$status->id);
         Cache::forget('user:account:id:'.$user->id);
@@ -4020,13 +3978,9 @@ class ApiV1Controller extends Controller
                 });
         }
 
-        $res = StatusService::getMastodon($status->id, false);
-        $res['favourited'] = false;
-        $res['language'] = 'en';
-        $res['bookmarked'] = false;
-        $res['card'] = null;
+        $res = $pe ? StatusService::get($status->id, false) : StatusService::getMastodon($status->id, false);
 
-        return $this->json($res);
+        return $this->json($this->decorateNewStatus($res));
     }
 
     /**
@@ -4040,15 +3994,35 @@ class ApiV1Controller extends Controller
         abort_unless($request->user()->tokenCan('write'), 403);
 
         AccountService::setLastActive($request->user()->id);
-        $status = Status::whereProfileId($request->user()->profile->id)
-            ->findOrFail($id);
+        $pid = $request->user()->profile_id;
+        $status = Status::whereProfileId($pid)->find($id);
+
+        if (! $status) {
+            $message = DmMessage::where('profile_id', $pid)->find($id);
+            abort_if(! $message, 404);
+
+            $payloads = app(DirectMessagePayloadService::class);
+            $res = $payloads->mastodonStatusById($message->id, $pid);
+            abort_if(! $res, 404);
+
+            app(DirectMessageService::class)->deleteMessage($message);
+
+            $res['text'] = $res['content_text'];
+            unset($res['content']);
+
+            return $this->json($res);
+        }
 
         $resource = new Fractal\Resource\Item($status, new StatusTransformer);
 
+        $res = $this->fractal->createData($resource)->toArray();
+
+        Cache::forget('_api:statuses:recent_9:'.$status->profile_id);
         Cache::forget('profile:status_count:'.$status->profile_id);
+        Cache::forget('profile:embed:'.$status->profile_id);
+        StatusService::del($status->id, true);
         StatusDelete::dispatch($status);
 
-        $res = $this->fractal->createData($resource)->toArray();
         $res['text'] = $res['content'];
         unset($res['content']);
 
@@ -4176,6 +4150,7 @@ class ApiV1Controller extends Controller
 
         $this->validate($request, [
             'page' => 'nullable|integer|max:40',
+            'cursor' => 'sometimes|string|max:2000',
             'min_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
             'max_id' => 'nullable|integer|min:0|max:'.PHP_INT_MAX,
             'limit' => 'sometimes|integer|min:1',
@@ -4210,13 +4185,47 @@ class ApiV1Controller extends Controller
 
         $min = $request->input('min_id');
         $max = $request->input('max_id');
-        $limit = $request->input('limit', 20);
-        if ($limit > 40) {
-            $limit = 40;
-        }
+        $limit = min((int) $request->input('limit', 20), 40);
         $onlyMedia = $request->boolean('only_media', true);
         $pe = $request->has(self::PF_API_ENTITY_KEY);
-        $pid = $request->user()->profile_id;
+        $pid = (int) $user->profile_id;
+
+        $maxPages = (int) config('instance.timeline.tag.max_pages', 10);
+        $cursorTtl = (int) config('instance.timeline.tag.cursor_ttl', 3600);
+        $scanLimit = 100;
+
+        $ctx = hash('sha256', implode('|', [
+            $user->id,
+            'tag-timeline',
+            'hashtag:'.$tag->id,
+            'limit:'.$limit,
+            'only_media:'.(int) $onlyMedia,
+            'pe:'.(int) $pe,
+        ]));
+
+        $hops = 0;
+        $boundary = null;
+
+        if ($request->filled('cursor')) {
+            ['cursor' => $decoded, 'hops' => $hops] = CursorToken::decode($request->input('cursor'), $ctx);
+
+            if ($hops >= $maxPages || ! ctype_digit($decoded)) {
+                return $this->json([]);
+            }
+
+            $boundary = (int) $decoded;
+        } elseif ($max) {
+            return $this->json([]);
+        }
+
+        $sinceMode = ! $boundary && $min;
+
+        if ($sinceMode) {
+            $minMax = SnowflakeService::byDate(now()->subMonths(9));
+            if (intval($min) < $minMax) {
+                return $this->json([]);
+            }
+        }
 
         $cachedFilters = CustomFilter::getCachedFiltersForAccount($pid);
 
@@ -4226,85 +4235,101 @@ class ApiV1Controller extends Controller
             return in_array('tags', $filter->context);
         });
 
-        if ($min || $max) {
-            $minMax = SnowflakeService::byDate(now()->subMonths(9));
-            if ($min && intval($min) < $minMax) {
-                return [];
-            }
-            if ($max && intval($max) < $minMax) {
-                return [];
-            }
-        }
-
         $filters = UserFilterService::filters($pid);
         $domainBlocks = UserFilterService::domainBlocks($pid);
 
-        if (! $min && ! $max) {
-            $id = 1;
-            $dir = '>';
-        } else {
-            $dir = $min ? '>' : '<';
-            $id = $min ?? $max;
-        }
-
-        $res = StatusHashtag::whereHashtagId($tag->id)
-            ->where('status_id', $dir, $id)
+        $ids = StatusHashtag::whereHashtagId($tag->id)
+            ->when($boundary, fn ($q) => $q->where('status_id', '<', $boundary))
+            ->when($sinceMode, fn ($q) => $q->where('status_id', '>', $min))
             ->whereIn('status_visibility', ['public', 'unlisted'])
             ->orderBy('status_id', 'desc')
-            ->limit(100)
-            ->pluck('status_id')
-            ->map(function ($i) use ($pe) {
-                return $pe ? StatusService::get($i, false) : StatusService::getMastodon($i, false);
-            })
-            ->filter(function ($i) use ($onlyMedia, $pid) {
-                if (! $i || ! isset($i['account'], $i['account']['id'])) {
-                    return false;
+            ->limit($scanLimit)
+            ->pluck('status_id');
+
+        $res = [];
+        $lastScanned = null;
+
+        foreach ($ids as $sid) {
+            $lastScanned = $sid;
+
+            $status = $pe ? StatusService::get($sid, false) : StatusService::getMastodon($sid, false);
+
+            if (! $status || ! isset($status['account']['id'], $status['url'])) {
+                continue;
+            }
+
+            $authorId = (int) $status['account']['id'];
+
+            if ($status['visibility'] === 'unlisted' && $authorId !== $pid) {
+                continue;
+            }
+
+            if (
+                $status['visibility'] === 'private' &&
+                $authorId !== $pid &&
+                ! FollowerService::follows($pid, $status['account']['id'], true)
+            ) {
+                continue;
+            }
+
+            if ($onlyMedia && empty($status['media_attachments'])) {
+                continue;
+            }
+
+            if (in_array($status['account']['id'], $filters)) {
+                continue;
+            }
+
+            $domain = strtolower((string) parse_url($status['url'], PHP_URL_HOST));
+            if (in_array($domain, $domainBlocks)) {
+                continue;
+            }
+
+            $filterResults = CustomFilter::applyCachedFilters($tagFilters, $status);
+
+            if (! empty($filterResults)) {
+                $status['filtered'] = $filterResults;
+                $shouldHide = collect($filterResults)->contains(function ($result) {
+                    return $result['filter']['filter_action'] === 'hide';
+                });
+
+                if ($shouldHide) {
+                    continue;
                 }
-                if ($i['visibility'] === 'unlisted') {
-                    if ((int) $i['account']['id'] !== $pid) {
-                        return false;
-                    }
-                }
-                if ($i['visibility'] === 'private') {
-                    if ((int) $i['account']['id'] !== $pid) {
-                        return FollowerService::follows($pid, $i['account']['id'], true);
-                    }
-                }
-                if ($onlyMedia == true) {
-                    if (! isset($i['media_attachments']) || ! count($i['media_attachments'])) {
-                        return false;
-                    }
-                }
+            }
 
-                return $i && isset($i['account'], $i['url']);
-            })
-            ->filter(function ($i) use ($filters, $domainBlocks) {
-                $domain = strtolower(parse_url($i['url'], PHP_URL_HOST));
+            $res[] = $status;
 
-                return ! in_array($i['account']['id'], $filters) && ! in_array($domain, $domainBlocks);
-            })
-            ->map(function ($status) use ($tagFilters) {
-                $filterResults = CustomFilter::applyCachedFilters($tagFilters, $status);
+            if (count($res) >= $limit) {
+                break;
+            }
+        }
 
-                if (! empty($filterResults)) {
-                    $status['filtered'] = $filterResults;
-                    $shouldHide = collect($filterResults)->contains(function ($result) {
-                        return $result['filter']['filter_action'] === 'hide';
-                    });
+        $hasMore = count($res) >= $limit || $ids->count() >= $scanLimit;
 
-                    if ($shouldHide) {
-                        return null;
-                    }
-                }
+        $baseUrl = $request->url();
+        $shared = [
+            'limit' => $limit,
+            'only_media' => $onlyMedia ? 'true' : 'false',
+        ];
+        if ($pe) {
+            $shared[self::PF_API_ENTITY_KEY] = 1;
+        }
 
-                return $status;
-            })
-            ->filter()
-            ->take($limit)
-            ->values()
-            ->toArray();
+        $links = [];
 
-        return $this->json($res);
+        if (! $sinceMode && $hasMore && $lastScanned && ($hops + 1) < $maxPages) {
+            $token = CursorToken::encode((string) $lastScanned, $ctx, $hops + 1, $cursorTtl);
+            $links[] = '<'.$baseUrl.'?'.http_build_query($shared + ['cursor' => $token]).'>; rel="next"';
+        }
+
+        if (! empty($res)) {
+            $links[] = '<'.$baseUrl.'?'.http_build_query($shared + ['min_id' => $res[0]['id']]).'>; rel="prev"';
+        }
+
+        $headers = empty($links) ? [] : ['Link' => implode(', ', $links)];
+
+        return $this->json($res, 200, $headers);
     }
 
     /**
@@ -4317,60 +4342,73 @@ class ApiV1Controller extends Controller
 
         $this->validate($request, [
             'limit' => 'sometimes|integer|min:1',
-            'max_id' => 'nullable|integer|min:0',
-            'since_id' => 'nullable|integer|min:0',
-            'min_id' => 'nullable|integer|min:0',
+            'cursor' => 'sometimes|string',
         ]);
 
         $pe = $request->has('_pe');
         $pid = $request->user()->profile_id;
-        $limit = $request->input('limit') ?? 20;
-        if ($limit > 40) {
-            $limit = 40;
+        $limit = min((int) $request->input('limit', 20), 40);
+
+        $query = ['limit' => $limit];
+
+        if ($pe) {
+            $query['_pe'] = 1;
         }
-        $max_id = $request->input('max_id');
-        $since_id = $request->input('since_id');
-        $min_id = $request->input('min_id');
 
-        $dir = $min_id ? '>' : '<';
-        $id = $min_id ?? $max_id;
-
-        $bookmarkQuery = Bookmark::whereProfileId($pid)
+        $page = Bookmark::query()
+            ->select('id', 'status_id')
+            ->where('profile_id', $pid)
             ->orderByDesc('id')
-            ->cursorPaginate($limit);
+            ->cursorPaginate($limit)
+            ->appends($query);
 
-        $bookmarks = $bookmarkQuery->map(function ($bookmark) use ($pid, $pe) {
-            $status = $pe ? StatusService::get($bookmark->status_id, false) : StatusService::getMastodon($bookmark->status_id, false);
+        $statusIds = $page->pluck('status_id')->all();
 
-            if ($status) {
-                $status['bookmarked'] = true;
-                $status['favourited'] = LikeService::liked($pid, $status['id']);
-                $status['reblogged'] = ReblogService::get($pid, $status['id']);
+        if (! $statusIds) {
+            return $this->json([]);
+        }
+
+        $liked = Like::where('profile_id', $pid)
+            ->whereIn('status_id', $statusIds)
+            ->pluck('status_id')
+            ->flip()
+            ->all();
+
+        $reblogged = Status::where('profile_id', $pid)
+            ->whereIn('reblog_of_id', $statusIds)
+            ->pluck('reblog_of_id')
+            ->flip()
+            ->all();
+
+        $bookmarks = [];
+
+        foreach ($statusIds as $statusId) {
+            $status = $pe
+                ? StatusService::get($statusId, false, false, $pid)
+                : StatusService::getMastodon($statusId, false, $pid);
+
+            if (! $status) {
+                continue;
             }
 
-            return $status;
-        })
-            ->filter()
-            ->values()
-            ->toArray();
+            $status['bookmarked'] = true;
+            $status['favourited'] = isset($liked[$statusId]);
+            $status['reblogged'] = isset($reblogged[$statusId]);
 
-        $links = null;
-        $headers = [];
-
-        if ($bookmarkQuery->nextCursor()) {
-            $links .= '<'.$bookmarkQuery->nextPageUrl().'&limit='.$limit.'>; rel="next"';
+            $bookmarks[] = $status;
         }
 
-        if ($bookmarkQuery->previousCursor()) {
-            if ($links != null) {
-                $links .= ', ';
-            }
-            $links .= '<'.$bookmarkQuery->previousPageUrl().'&limit='.$limit.'>; rel="prev"';
+        $links = [];
+
+        if ($page->nextCursor()) {
+            $links[] = '<'.$page->nextPageUrl().'>; rel="next"';
         }
 
-        if ($links) {
-            $headers = ['Link' => $links];
+        if ($page->previousCursor()) {
+            $links[] = '<'.$page->previousPageUrl().'>; rel="prev"';
         }
+
+        $headers = $links ? ['Link' => implode(', ', $links)] : [];
 
         return $this->json($bookmarks, 200, $headers);
     }
@@ -4804,8 +4842,8 @@ class ApiV1Controller extends Controller
         abort_unless($request->user()->tokenCan('write'), 403);
 
         $pid = $request->user()->profile_id;
-        $home = $request->input('home[last_read_id]');
-        $notifications = $request->input('notifications[last_read_id]');
+        $home = $request->input('home.last_read_id');
+        $notifications = $request->input('notifications.last_read_id');
 
         if ($home) {
             return $this->json(MarkerService::set($pid, 'home', $home));
