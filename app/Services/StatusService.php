@@ -72,8 +72,13 @@ class StatusService
         if ($viewerProfileId !== null) {
             $ownerProfileId = $res['_pid'] ?? null;
             $visibility = $res['visibility'] ?? null;
+            $addressee = $res['in_reply_to_account_id'] ?? null;
 
-            if (! self::isVisibleTo(
+            $isAddressee = $visibility === 'private' &&
+                $addressee &&
+                (int) $addressee === (int) $viewerProfileId;
+
+            if (! $isAddressee && ! self::isVisibleTo(
                 $ownerProfileId,
                 $visibility,
                 $viewerProfileId
@@ -99,7 +104,7 @@ class StatusService
             && ! request()->filled('include_reblogs')
             && ! empty($res['reblog'])
         ) {
-            foreach (['content', 'content_text', 'emojis', 'media_attachments'] as $key) {
+            foreach (['content', 'content_text', 'emojis', 'media_attachments', 'sensitive', 'spoiler_text'] as $key) {
                 if (array_key_exists($key, $res['reblog'])) {
                     $res[$key] = $res['reblog'][$key];
                 }
@@ -133,6 +138,13 @@ class StatusService
 
         // The shared status nests under `reblog` and needs Mastodon field names too
         if (! empty($status['reblog'])) {
+            if (isset($status['reblog']['account']['id'])) {
+                $status['reblog']['account'] = AccountService::getMastodon(
+                    $status['reblog']['account']['id'],
+                    true
+                );
+            }
+
             $status['reblog']['replies_count'] = $status['reblog']['reply_count'] ?? 0;
             $status['reblog']['favourited'] = false;
             $status['reblog']['muted'] = false;
@@ -219,6 +231,46 @@ class StatusService
             default:
                 return false;
         }
+    }
+
+    public static function isReplyVisibleTo(
+        $replyOwnerProfileId,
+        $replyScope,
+        $replyIsLocal,
+        $parentOwnerProfileId,
+        $parentScope,
+        $viewerProfileId
+    ): bool {
+        if (! $replyOwnerProfileId || ! $viewerProfileId) {
+            return false;
+        }
+
+        if (in_array($replyScope, ['public', 'unlisted'], true)) {
+            return true;
+        }
+
+        if ($replyScope !== 'private') {
+            return false;
+        }
+
+        $replyOwnerProfileId = (int) $replyOwnerProfileId;
+        $viewerProfileId = (int) $viewerProfileId;
+
+        if (
+            $replyOwnerProfileId === $viewerProfileId ||
+            (int) $parentOwnerProfileId === $viewerProfileId
+        ) {
+            return true;
+        }
+
+        if ($parentScope === 'private' && $replyIsLocal) {
+            return true;
+        }
+
+        return (bool) FollowerService::follows(
+            (string) $viewerProfileId,
+            (string) $replyOwnerProfileId
+        );
     }
 
     public static function clampReplyVisibility(

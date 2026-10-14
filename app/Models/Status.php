@@ -136,6 +136,10 @@ class Status extends Model
 
     protected $guarded = [];
 
+    protected $attributes = [
+        'reply_count' => 0,
+    ];
+
     protected function casts(): array
     {
         return [
@@ -266,6 +270,9 @@ class Status extends Model
     public function mediaUrl()
     {
         $media = $this->firstMedia();
+        if (! $media) {
+            return null;
+        }
         $path = $media->media_path;
         $hash = is_null($media->processed_at) ? md5('unprocessed') : md5($media->created_at);
         $url = $media->cdn_url ? $media->cdn_url."?v={$hash}" : url(Storage::url($path)."?v={$hash}");
@@ -353,7 +360,10 @@ class Status extends Model
     {
         $parent = $this->in_reply_to_id ?? $this->reblog_of_id;
         if (! empty($parent)) {
-            return $this->findOrFail($parent);
+            // A deleted parent must not throw: callers treat the result as
+            // nullable (reply/reblog to a since-removed status), so return
+            // null rather than raising ModelNotFoundException.
+            return $this->find($parent);
         }
 
         return false;
@@ -379,7 +389,17 @@ class Status extends Model
             return null;
         }
 
-        return $parent->object_url ?: $parent->url();
+        if ($parent->object_url) {
+            return $parent->object_url;
+        }
+
+        // Remote parents without an object id must not emit a permalink as
+        // inReplyTo. Local parents have no uri and resolve to their own id.
+        if ($parent->uri) {
+            return null;
+        }
+
+        return $parent->url();
     }
 
     public function conversation()
